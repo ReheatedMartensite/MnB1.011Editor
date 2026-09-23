@@ -263,6 +263,102 @@ def item_categories(it):
     return is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing
 
 
+# ---- 伤害值编码: 原始值 <256=砍, +256=刺, +512=钝 (与 decode_damage 互逆) ----
+DMG_KINDS = ("砍", "刺", "钝")
+_DMG_OFF = {"砍": 0, "刺": 256, "钝": 512}
+
+
+def split_damage(raw):
+    """伤害原始值 -> (数值, 类型), 与 decode_damage 互逆。"""
+    if raw is None:
+        return 0, "砍"
+    if raw >= 512:
+        return raw - 512, "钝"
+    if raw >= 256:
+        return raw - 256, "刺"
+    return raw, "砍"
+
+
+def encode_damage(val, kind):
+    """(数值, 类型) -> 伤害原始值。"""
+    try:
+        v = int(val)
+    except Exception:
+        v = 0
+    if v < 0:
+        v = 0
+    return v + _DMG_OFF.get(kind, 0)
+
+
+def item_attr_fields(it):
+    """按物品类型, 为 it['stats'] 的每个位置给出可读标签 —— 属性编辑器的唯一真源。
+
+    返回 [(绝对索引, 标签, 是否伤害字段)]。标签与 format_item 显示的分组保持一致,
+    填充(fill)与应用(apply)共用本函数, 避免两边索引/标签漂移。
+    """
+    stats = it["stats"]
+    n = len(stats)
+    is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = item_categories(it)
+    spec = []
+
+    def add(idx, label, dmg=False):
+        if 0 <= idx < n:
+            spec.append((idx, label, dmg))
+
+    # 前 4 项对所有物品同构, 只是语义随类型变化
+    if n >= 4:
+        add(0, "货物数量" if is_goods else "头防")
+        add(1, "马匹防御" if is_horse else ("盾牌抗性" if is_shield else "身防"))
+        add(2, "精度" if (is_ranged or is_ammo or is_throwing) else "腿防")
+        add(3, "需求 / 难度")
+
+    if is_horse and n >= 10:
+        add(4, "生命")
+        add(5, "马匹速度")
+        add(6, "操纵")
+        add(7, "字段7")
+        add(9, "冲锋")
+
+    if is_shield and n >= 8:
+        add(4, "耐久")
+        add(5, "盾牌速度")
+        add(7, "尺寸")
+
+    # 弹药/武器段走负索引, 这里换算成绝对索引
+    if is_ammo and n >= 11:
+        add(n - 4, "长度/模型缩放")
+        add(n - 3, "数量")
+        add(n - 2, "伤害", True)
+
+    weapon_like = (
+        not is_goods
+        and not is_horse
+        and not is_shield
+        and not is_ammo
+        and n >= 11
+        and ((stats[5] not in (None, 0)) or (stats[-2] not in (None, 0)) or (stats[-1] not in (None, 0)))
+    )
+    if weapon_like:
+        add(n - 6, "武器速度")
+        if is_ranged or is_throwing:
+            add(n - 5, "弹道飞行速度")
+        else:
+            add(n - 4, "范围 / 长度")
+        if is_throwing:
+            add(n - 3, "数量")
+        add(n - 2, "伤害1", True)
+        add(n - 1, "伤害2", True)
+
+    # 同一索引只保留首个标签, 避免生成重复行
+    out, seen = [], set()
+    for idx, label, dmg in spec:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append((idx, label, dmg))
+    return out
+
+
 class ScrolledFrame(ttk.Frame):
     """内部放一个可垂直滚动的 Frame (用于 74 行物品槽网格)。"""
     def __init__(self, master, **kw):
@@ -282,7 +378,7 @@ class ViewerV2:
     def __init__(self, root):
         self.root = root
         self.root.title("骑马与砍杀 1.011 兵种/物品查看器 v2 (含技能位置对照)")
-        self.root.geometry("1360x860")
+        self.root.geometry("1360x960")
 
         self.mod = M.ModuleData()
         self.doc = None            # 已载入的存档 (可选)
@@ -391,12 +487,13 @@ class ViewerV2:
         sb.config(command=self.tlist.yview)
         self.tlist.bind("<<ListboxSelect>>", self.on_troop_select)
 
-        # 右侧: 上=概要, 下=技能表
+        # 右侧: 多面板 (各独立, 互不挤压)
         vp = tk.PanedWindow(rf, orient="vertical")
         vp.pack(fill="both", expand=True)
 
-        gf = ttk.LabelFrame(vp, text="概要")
-        vp.add(gf, stretch="always", height=250)
+        # 1) 概要 / 标志位(tf_*)勾选编辑 —— 修改 troops.txt 模板(影响新开局)
+        gf = ttk.LabelFrame(vp, text="概要 / 标志位 tf_*")
+        vp.add(gf, stretch="always", height=320)
         # 阵营(跳槽)编辑栏: 修改存档中该兵种的当前所属阵营
         facbar = ttk.Frame(gf)
         facbar.pack(side="top", fill="x", padx=4, pady=2)
@@ -411,30 +508,73 @@ class ViewerV2:
         self.fac_hint.pack(side="left", padx=6)
         # 标志位(tf_*)勾选编辑面板: 修改 troops.txt 抽象兵种头行的 flags (影响新开局)
         # 程序在「勾选项 ↔ 数值」之间自动转换, 用户无需理解每一位代表什么。
-        flf = ttk.LabelFrame(gf, text="标志位 tf_* (勾选即生效, 程序自动算值)")
-        flf.pack(side="top", fill="x", padx=4, pady=2)
-        self.flag_calc = ttk.Label(flf, text="当前值: 0x00000000 (十进制 0)", foreground="#555")
-        self.flag_calc.pack(side="top", fill="x", padx=6, pady=(3, 0))
-        fgrid = ttk.Frame(flf)
-        fgrid.pack(side="top", fill="x", padx=6, pady=2)
-        self.tf_vars = []          # [(mask, BooleanVar), ...], 顺序同 M.TF_NAMES
-        for k, (mask, name) in enumerate(M.TF_NAMES):
-            var = tk.BooleanVar()
-            cb = ttk.Checkbutton(fgrid, text=name, variable=var,
-                                 command=self._update_troop_flag_calc)
-            cb.grid(row=k // 3, column=k % 3, sticky="w", padx=4, pady=1)
-            self.tf_vars.append((mask, var))
+        flf = ttk.LabelFrame(gf, text="标志位 (勾选即写入模板, 点『保存模块』写盘)")
+        flf.pack(side="top", fill="both", expand=True, padx=4, pady=2)
+        # ⚠ 先把「按钮行」按 bottom 侧 pack(在其它内容之前), 这样即使 pane 被压缩,
+        #   packer 也会先为按钮行保留高度 —— 否则按钮会塌成 1px 不可见/不可点(历史 bug)。
         fbbar = ttk.Frame(flf)
-        fbbar.pack(side="top", fill="x", padx=6, pady=(2, 4))
+        fbbar.pack(side="bottom", fill="x", padx=6, pady=(2, 4))
         ttk.Button(fbbar, text="应用标志位", command=self.on_troop_flag).pack(side="left", padx=2)
         self.flag_hint = ttk.Label(fbbar, text="模板·未保存", foreground="#888")
         self.flag_hint.pack(side="left", padx=6)
-        self.tdetail = self._mk_text(gf)
+        self.flag_calc = ttk.Label(flf, text="当前值: 0x00000000 (十进制 0)", foreground="#555")
+        self.flag_calc.pack(side="top", fill="x", padx=6, pady=(3, 0))
+        fgrid = ttk.Frame(flf)
+        fgrid.pack(side="top", fill="both", expand=True, padx=6, pady=2)
+        self.tf_vars = []          # [(mask, BooleanVar), ...], 顺序同 M.TF_NAMES
+        for k, (mask, name) in enumerate(M.TF_NAMES):
+            var = tk.BooleanVar()
+            # 勾选即写入模板内存(真正"勾选即生效"), 见 _on_tf_toggle
+            cb = ttk.Checkbutton(fgrid, text=name, variable=var,
+                                 command=self._on_tf_toggle)
+            cb.grid(row=k // 5, column=k % 5, sticky="w", padx=4, pady=1)
+            self.tf_vars.append((mask, var))
 
-        sf = ttk.LabelFrame(vp, text="技能 (按 skills.txt 位置对照, 位域 48 位)")
-        vp.add(sf, stretch="always", height=330)
+        # 2) 兵种详情 (解码文本, 独立可滚动面板) —— 属性/熟练/技能/升级/阵营/标志位 全部可见
+        df = ttk.LabelFrame(vp, text="兵种详情 (已解码)")
+        vp.add(df, stretch="always", height=150)
+        self.tdetail = self._mk_text(df, height=12)
+
+        # 3) 属性 / 熟练 (可编辑) —— 还原旧版查看器逐项编辑能力
+        af = ttk.LabelFrame(vp, text="属性 / 熟练 (可编辑, 保存模块生效)")
+        vp.add(af, stretch="always", height=130)
+        arow = ttk.Frame(af)
+        arow.pack(side="top", fill="x", padx=4, pady=2)
+        self.edit_attr_vars = []
+        for lbl in ("力量", "敏捷", "智力", "魅力", "等级"):
+            ttk.Label(arow, text=lbl).pack(side="left", padx=(4, 0))
+            v = tk.StringVar()
+            self.edit_attr_vars.append(v)
+            ttk.Entry(arow, textvariable=v, width=5).pack(side="left", padx=(0, 5))
+        ttk.Button(arow, text="应用属性", command=self.apply_troop_attrs).pack(side="left", padx=6)
+        prow = ttk.Frame(af)
+        prow.pack(side="top", fill="x", padx=4, pady=2)
+        ttk.Label(prow, text="熟练:").pack(side="left")
+        self.edit_prof_vars = []
+        for lbl in ("单手", "双手", "长杆", "弓", "弩", "投掷", "火器"):
+            ttk.Label(prow, text=lbl).pack(side="left", padx=(4, 0))
+            v = tk.StringVar()
+            self.edit_prof_vars.append(v)
+            ttk.Entry(prow, textvariable=v, width=4).pack(side="left", padx=(0, 4))
+        ttk.Button(prow, text="应用熟练", command=self.apply_troop_profs).pack(side="left", padx=6)
+
+        # 4) 技能 (显示 + 可编辑) —— 还原旧版查看器的技能行编辑, 并保留 tpl/sav 对照表
+        sf = ttk.LabelFrame(vp, text="技能 (按 skills.txt 位置对照, 位域 48 位, 可编辑)")
+        vp.add(sf, stretch="always", height=250)
+        # ⚠ 先按 bottom 侧 pack「技能编辑行」, 保证 pane 被压缩时输入框与按钮仍可见
+        #   (历史 bug: 该行曾塌成 1px, 导致"技能无法编辑")。
+        skedit = ttk.Frame(sf)
+        skedit.pack(side="bottom", fill="x", padx=4, pady=2)
+        ttk.Label(skedit, text="选中技能等级:").pack(side="left")
+        self.edit_skill_lv_var = tk.StringVar(value="0")
+        ttk.Entry(skedit, textvariable=self.edit_skill_lv_var, width=5).pack(side="left", padx=(0, 4))
+        ttk.Button(skedit, text="应用选中技能", command=self.apply_troop_skill_selected).pack(side="left", padx=4)
+        ttk.Label(skedit, text="整行(6词,可16进制):").pack(side="left", padx=(12, 0))
+        self.edit_skill_raw_var = tk.StringVar()
+        ttk.Entry(skedit, textvariable=self.edit_skill_raw_var, width=46).pack(side="left", padx=(0, 4))
+        ttk.Button(skedit, text="应用技能行", command=self.apply_troop_skills_raw).pack(side="left", padx=4)
         cols = ("pos", "id", "name", "tpl", "sav")
-        self.skill_tv = ttk.Treeview(sf, columns=cols, show="headings", height=14)
+        self.skill_tv = ttk.Treeview(sf, columns=cols, show="headings", height=8)
         for c, w, t in (("pos", 50, "位置"), ("id", 210, "技能ID"),
                         ("name", 110, "中文"), ("tpl", 60, "模板"), ("sav", 60, "存档")):
             self.skill_tv.heading(c, text=t)
@@ -445,9 +585,11 @@ class ViewerV2:
         self.skill_tv.pack(fill="both", expand=True)
         self.skill_tv.tag_configure("nz", background="#d9f2d9")
         self.skill_tv.tag_configure("diff", background="#ffe0e0")
+        self.skill_tv.bind("<<TreeviewSelect>>", self._on_skill_select)
 
+        # 5) 物品栏 / 装备 (可编辑) —— 保留(唯一始终可用的保存路径)
         ef = ttk.LabelFrame(vp, text="物品栏 / 装备 (可编辑)")
-        vp.add(ef, stretch="always", height=240)
+        vp.add(ef, stretch="always", height=220)
         hdr = ttk.Frame(ef)
         hdr.pack(side="top", fill="x", padx=4, pady=2)
         self.inv_summary = ttk.Label(hdr, text="背包=模板·装备=实例", anchor="w")
@@ -486,10 +628,11 @@ class ViewerV2:
         rvp = tk.PanedWindow(rf, orient="vertical")
         rvp.pack(fill="both", expand=True)
         det_f = ttk.LabelFrame(rvp, text="物品详情 (属性已解码)")
-        rvp.add(det_f, stretch="always", height=360)
+        rvp.add(det_f, stretch="always", height=300)
         self.idetail = self._mk_text(det_f)
         ed_f = ttk.LabelFrame(rvp, text="属性 (可编辑, 保存物品生效)")
-        rvp.add(ed_f, stretch="always", height=170)
+        # 高度需容纳: 基础行 + 整串数值行 + 逐项属性(最多约 9 行) + 两个按钮行
+        rvp.add(ed_f, stretch="always", height=350)
         ef = ttk.Frame(ed_f); ef.pack(fill="x", padx=4, pady=2)
         ttk.Label(ef, text="价格:").pack(side="left")
         self.edit_price_var = tk.StringVar()
@@ -507,6 +650,18 @@ class ViewerV2:
         ttk.Entry(sf, textvariable=self.edit_stats_var).pack(side="left", fill="x", expand=True, padx=(0, 4))
         ttk.Button(sf, text="应用数值", command=self.apply_item_stats).pack(side="left", padx=4)
 
+        # 逐项属性编辑器: 标签随物品类型变化(与上方详情区一致), 直接写回对应 stats 位置
+        af = ttk.LabelFrame(ed_f, text="逐项属性 (按物品类型自动识别)")
+        af.pack(fill="x", padx=4, pady=2)
+        self.attr_rows = ttk.Frame(af)
+        self.attr_rows.pack(fill="x")
+        ab = ttk.Frame(af)
+        ab.pack(fill="x", padx=4, pady=2)
+        ttk.Button(ab, text="应用属性", command=self.apply_item_attrs).pack(side="left")
+        ttk.Label(ab, text="(写回后续数值的对应位置; 未列出的位置保持原样)",
+                  foreground="#666").pack(side="left", padx=6)
+        self.attr_widgets = []
+
     def build_compare_tab(self):
         top = ttk.Frame(self.tab_cmp)
         top.pack(fill="x", padx=4, pady=3)
@@ -514,12 +669,13 @@ class ViewerV2:
         ttk.Button(top, text="立即对照", command=self.run_compare).pack(side="left", padx=6)
         self.cmp_detail = self._mk_text(self.tab_cmp, expand=True)
 
-    def _mk_text(self, parent, expand=True):
+    def _mk_text(self, parent, expand=True, height=None):
         f = ttk.Frame(parent)
         f.pack(fill="both", expand=True)
         sb = ttk.Scrollbar(f)
         sb.pack(side="right", fill="y")
-        t = tk.Text(f, wrap="word", font=("Microsoft YaHei UI", 9), yscrollcommand=sb.set)
+        kw = {"height": height} if height else {}
+        t = tk.Text(f, wrap="word", font=("Microsoft YaHei UI", 9), yscrollcommand=sb.set, **kw)
         t.pack(fill="both", expand=True)
         sb.config(command=t.yview)
         t.tag_configure("diff", foreground="#c0392b")
@@ -575,7 +731,7 @@ class ViewerV2:
         if getattr(self, "_inv_built", False):
             for w in self.inv_rows + self.equip_rows:
                 try:
-                    w["cmb"].current(0); w["type_var"].set(0); w["amt_var"].set(0)
+                    w["cmb"].current(0); w["type_var"].set(self._imod_text(0)); w["amt_var"].set(0)
                     w["cmb"].config(state="disabled"); w["sp_t"].config(state="disabled")
                     w["sp_a"].config(state="disabled"); w["btn"].config(state="disabled")
                 except Exception:
@@ -749,15 +905,18 @@ class ViewerV2:
         except Exception:
             pass
 
-    def on_troop_flag(self):
-        """改写兵种头行 flags (troops.txt 模板, 影响新开局)。
-        数值由勾选的 tf_* 项自动按位或计算; 不在勾选表里的未知位原样保留。"""
+    def _commit_troop_flags(self, report=True):
+        """把当前勾选写入模板 flags(troops.txt 头行)。
+        数值 = (原值中『不在勾选表里的未知位』) | (已勾选的 tf_* 位)，未知位原样保留。
+        返回写入的整数; 失败/无选中返回 None。"""
         if self.cur is None:
-            self.set_status("请先选择兵种。", err=True)
-            return
+            if report:
+                self.set_status("请先选择兵种。", err=True)
+            return None
         if not getattr(self, "tf_vars", None):
-            self.set_status("标志位面板尚未初始化。", err=True)
-            return
+            if report:
+                self.set_status("标志位面板尚未初始化。", err=True)
+            return None
         known_all = 0
         for mask, _ in self.tf_vars:
             known_all |= mask
@@ -769,10 +928,148 @@ class ViewerV2:
         try:
             self.mod.set_troop_flags(self.cur, v)
         except Exception as ex:
+            if report:
+                self.set_status(f"写入失败: {ex}", err=True)
+            return None
+        try:
+            self.flag_hint.config(text="模板·未保存")
+        except Exception:
+            pass
+        if report:
+            self.set_status(
+                f"标志位已改为 0x{v & 0xFFFFFFFF:08X} (模板改动, 点『保存模块』写盘生效)", ok=True)
+        return v
+
+    def _on_tf_toggle(self):
+        """勾选框回调: 勾选即写入模板内存并刷新『当前值』(真正『勾选即生效』)。
+        这样即便用户没找到『应用标志位』按钮, 勾选也已进入待保存状态。"""
+        self._update_troop_flag_calc()
+        if self.cur is not None:
+            self._commit_troop_flags()
+
+    def on_troop_flag(self):
+        """『应用标志位』按钮: 走与勾选即时写入相同的提交路径(冗余入口, 不削弱)。"""
+        v = self._commit_troop_flags()
+        if v is not None:
+            self.show_troop(self.cur)
+
+    # ---- 属性 / 熟练 / 技能 编辑 (还原旧版查看器的逐项编辑能力) ----
+    def apply_troop_attrs(self):
+        """改写模板属性行: 力量/敏捷/智力/魅力/等级 (troops.txt, 影响新开局)。"""
+        if self.cur is None:
+            self.set_status("请先选择兵种。", err=True)
+            return
+        vals = []
+        for v in self.edit_attr_vars:
+            s = (v.get() or "").strip()
+            try:
+                vals.append(int(s))
+            except Exception:
+                self.set_status("属性必须为整数 (力量/敏捷/智力/魅力/等级)。", err=True)
+                return
+        if len(vals) != 5:
+            self.set_status("需要 5 个整数。", err=True)
+            return
+        try:
+            self.mod.set_troop_attrs(self.cur, vals)
+        except Exception as ex:
             self.set_status(f"写入失败: {ex}", err=True)
             return
         self.show_troop(self.cur)
-        self.set_status(f"标志位已改为 0x{v & 0xFFFFFFFF:08X} (模板改动, 点『保存模块』生效)", ok=True)
+        self.set_status("属性已修改 (模板改动, 点『保存模块』生效)", ok=True)
+
+    def apply_troop_profs(self):
+        """改写模板武器熟练行: 单手/双手/长杆/弓/弩/投掷/火器。"""
+        if self.cur is None:
+            self.set_status("请先选择兵种。", err=True)
+            return
+        vals = []
+        for v in self.edit_prof_vars:
+            s = (v.get() or "").strip()
+            try:
+                vals.append(int(s))
+            except Exception:
+                self.set_status("熟练度必须为整数。", err=True)
+                return
+        if len(vals) != 7:
+            self.set_status("需要 7 个整数 (单手/双手/长杆/弓/弩/投掷/火器)。", err=True)
+            return
+        try:
+            self.mod.set_troop_profs(self.cur, vals)
+        except Exception as ex:
+            self.set_status(f"写入失败: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status("熟练已修改 (模板改动, 点『保存模块』生效)", ok=True)
+
+    @staticmethod
+    def _parse_hex_or_dec(s):
+        s = (s or "").strip()
+        if not s:
+            return 0
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        return int(s)
+
+    def _on_skill_select(self, ev=None):
+        sel = self.skill_tv.selection()
+        if not sel:
+            return
+        vals = self.skill_tv.item(sel[0], "values")
+        if not vals:
+            return
+        try:
+            self.edit_skill_lv_var.set(str(int(vals[3])))
+        except Exception:
+            self.edit_skill_lv_var.set("0")
+
+    def apply_troop_skill_selected(self):
+        """改写单个技能等级 (位域 48 位: 每技能 4bit, 位置 0..47)。"""
+        if self.cur is None:
+            self.set_status("请先选择兵种。", err=True)
+            return
+        sel = self.skill_tv.selection()
+        if not sel:
+            self.set_status("请先在技能表选中一行。", err=True)
+            return
+        pos = int(self.skill_tv.item(sel[0], "values")[0])
+        try:
+            lv = int((self.edit_skill_lv_var.get() or "0").strip())
+        except Exception:
+            self.set_status("等级必须为整数 (0..15)。", err=True)
+            return
+        if not (0 <= lv <= 15):
+            self.set_status("技能等级需在 0..15。", err=True)
+            return
+        try:
+            self.mod.set_troop_skill_level(self.cur, pos, lv)
+        except Exception as ex:
+            self.set_status(f"写入失败: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status(f"技能#{pos} 已设为 {lv} (模板改动, 点『保存模块』生效)", ok=True)
+
+    def apply_troop_skills_raw(self):
+        """改写整个技能行 (6 个 u32 打包字, 支持 16 进制)。等价于旧版『应用技能行』。"""
+        if self.cur is None:
+            self.set_status("请先选择兵种。", err=True)
+            return
+        parts = (self.edit_skill_raw_var.get() or "").split()
+        try:
+            words = [self._parse_hex_or_dec(p) & 0xFFFFFFFF for p in parts]
+        except Exception:
+            self.set_status("技能行含无效整数/16进制。", err=True)
+            return
+        if len(words) != 6:
+            self.set_status("技能行需要 6 个整数 (每词一个 u32)。", err=True)
+            return
+        try:
+            self.mod.set_troop_skills(self.cur, words)
+        except Exception as ex:
+            self.set_status(f"写入失败: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status("技能行已修改 (模板改动, 点『保存模块』生效)", ok=True)
 
     def show_troop(self, i):
         t = self.mod.troops[i]
@@ -852,6 +1149,18 @@ class ViewerV2:
             if sav is not None and sav[j] != v:
                 tags = ("diff",)
             self.skill_tv.insert("", "end", values=(j, sid, sname, v, sv), tags=tags)
+
+        # 填充属性/熟练编辑框 (还原旧版查看器的逐项编辑)
+        a = t.get("attrs", [])
+        for k, v in enumerate(self.edit_attr_vars):
+            v.set(fmt(a[k]) if k < len(a) else "")
+        p = t.get("profs", [])
+        for k, v in enumerate(self.edit_prof_vars):
+            v.set(fmt(p[k]) if k < len(p) else "")
+        # 技能整行(默认16进制)
+        sw = t.get("skills", [])
+        self.edit_skill_raw_var.set(" ".join("0x%x" % (int(x) & 0xFFFFFFFF) for x in sw))
+        self.edit_skill_lv_var.set("0")
 
         # 阵营下拉: 载入存档且兵种可靠时可改(即领主跳槽)
         self._sync_faction_combo(i)
@@ -962,7 +1271,7 @@ class ViewerV2:
         lines = []
         name = self._item_full_name(it)
         stats = it["stats"]
-        is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = self.item_categories(it)
+        is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = item_categories(it)
 
         lines.append(f"名称：{name}")
         lines.append(f"物品ID：{it['id']}")
@@ -1070,6 +1379,65 @@ class ViewerV2:
         self.edit_weight_var.set(fmt(it["weight"]))
         self.edit_abundance_var.set(fmt(it["abundance"]))
         self.edit_stats_var.set(" ".join(fmt(x) for x in it["stats"]))
+        self._build_attr_rows(it)
+
+    def _build_attr_rows(self, it):
+        """按物品类型重建逐项属性输入行 (标签来自 item_attr_fields)。"""
+        for w in self.attr_rows.winfo_children():
+            w.destroy()
+        self.attr_widgets = []
+        stats = it["stats"]
+        for idx, label, dmg in item_attr_fields(it):
+            row = ttk.Frame(self.attr_rows)
+            row.pack(fill="x", padx=4, pady=1)
+            ttk.Label(row, text=label, width=16, anchor="w").pack(side="left")
+            raw = stats[idx]
+            if dmg:
+                val, kind = split_damage(raw)
+                var = tk.StringVar(value=str(val))
+                ttk.Entry(row, textvariable=var, width=8).pack(side="left")
+                kv = tk.StringVar(value=kind)
+                ttk.Combobox(row, values=list(DMG_KINDS), width=3, state="readonly",
+                             textvariable=kv).pack(side="left", padx=2)
+                self.attr_widgets.append((idx, label, var, kv))
+            else:
+                var = tk.StringVar(value=fmt(raw))
+                ttk.Entry(row, textvariable=var, width=10).pack(side="left")
+                self.attr_widgets.append((idx, label, var, None))
+
+    def apply_item_attrs(self):
+        """把逐项属性的改动写回 stats (只改界面里列出的索引, 其余保持原样)。"""
+        if self.cur_item is None or not (0 <= self.cur_item < len(self.items_full)):
+            return
+        it = self.items_full[self.cur_item]
+        stats = list(it["stats"])
+        bad, updates = [], {}
+        for idx, label, var, kv in self.attr_widgets:
+            raw = var.get().strip()
+            try:
+                v = int(raw)
+            except ValueError:
+                bad.append(label)
+                continue
+            if kv is not None:          # 伤害字段: 数值 + 类型 -> 原始编码
+                if v < 0:
+                    bad.append(label)
+                    continue
+                v = encode_damage(v, kv.get())
+            updates[idx] = v
+        if bad:
+            messagebox.showwarning("输入错误", "以下属性需为整数: " + ", ".join(sorted(set(bad))))
+            return
+        if not updates:
+            return
+        for idx, v in updates.items():
+            if idx < len(stats):
+                stats[idx] = v
+        it["stats"] = stats
+        self.item_dirty = True
+        self._fill_item_edit(it)
+        self._set(self.idetail, self.format_item(it))
+        self.set_status("物品属性已修改（未保存）")
 
     def apply_item_basic(self):
         if self.cur_item is None or not (0 <= self.cur_item < len(self.items_full)):
@@ -1165,6 +1533,28 @@ class ViewerV2:
         self.equip_rows = [self._make_inv_row(parent, k, True) for k in range(M.EQUIP_SLOTS)]
         self._inv_built = True
 
+    # ---- 修饰符 (imod) 下拉辅助 ----
+    # 语义(已用全存档分布 + cns/item_modifiers.csv 验证):
+    #   存档槽位第二列 u32 = (修饰符 << 24) | 耐久/数量;
+    #   troops.txt 模板第二列 = 裸修饰符枚举(0=普通, 18=重型, 42=一大袋...)。
+    def _imod_options(self):
+        return ["%d %s" % (i, n) for i, n in enumerate(M.IMOD_NAMES)]
+
+    def _imod_text(self, v):
+        try:
+            v = int(v)
+        except Exception:
+            return "0"
+        if 0 <= v < len(M.IMOD_NAMES):
+            return "%d %s" % (v, M.IMOD_NAMES[v])
+        return str(v)
+
+    def _parse_imod(self, s):
+        try:
+            return max(0, min(255, int(str(s).strip().split()[0])))
+        except Exception:
+            return 0
+
     def _make_inv_row(self, parent, k, is_equip):
         r = ttk.Frame(parent)
         r.pack(fill="x", padx=6, pady=1)
@@ -1172,14 +1562,18 @@ class ViewerV2:
         ttk.Label(r, text=label, width=8).pack(side="left")
         cmb = ttk.Combobox(r, values=self.item_options, width=42, state="readonly")
         cmb.pack(side="left", padx=2)
-        ttk.Label(r, text="类型").pack(side="left")
-        type_var = tk.IntVar(value=0)
-        sp_t = ttk.Spinbox(r, from_=0, to=255, width=5, textvariable=type_var)
+        ttk.Label(r, text="修饰").pack(side="left")
+        type_var = tk.StringVar(value=self._imod_text(0))
+        sp_t = ttk.Combobox(r, values=self._imod_options(), width=11,
+                            textvariable=type_var)   # 可编辑: 也可直接输入原始数值
         sp_t.pack(side="left", padx=1)
-        ttk.Label(r, text="数量").pack(side="left")
         amt_var = tk.IntVar(value=0)
-        sp_a = ttk.Spinbox(r, from_=0, to=16777215, width=9, textvariable=amt_var)
-        sp_a.pack(side="left", padx=1)
+        sp_a = None
+        if is_equip:
+            # 仅存档行有「耐久/数量」: 马匹=生命, 盾牌=耐久, 食物=数量; 模板第二列无此段
+            ttk.Label(r, text="耐久/数量").pack(side="left")
+            sp_a = ttk.Spinbox(r, from_=0, to=16777215, width=9, textvariable=amt_var)
+            sp_a.pack(side="left", padx=1)
         btn = ttk.Button(r, text="清空", command=lambda k=k, eq=is_equip: self._clear_slot(k, eq))
         btn.pack(side="left", padx=2)
 
@@ -1190,19 +1584,24 @@ class ViewerV2:
         def on_amt(*a):
             self._apply_slot(k, is_equip)
         cmb.bind("<<ComboboxSelected>>", on_item)
+        sp_t.bind("<<ComboboxSelected>>", on_type)
         sp_t.bind("<FocusOut>", on_type); sp_t.bind("<Return>", on_type)
-        sp_a.bind("<FocusOut>", on_amt); sp_a.bind("<Return>", on_amt)
+        if sp_a is not None:
+            sp_a.bind("<FocusOut>", on_amt); sp_a.bind("<Return>", on_amt)
         return dict(cmb=cmb, type_var=type_var, amt_var=amt_var, sp_t=sp_t, sp_a=sp_a, btn=btn)
 
-    def _set_row(self, w, pair):
+    def _set_row(self, w, pair, is_equip):
         iid, mod = pair
         if iid == -1:
             w["cmb"].current(0)
         else:
             idx = (iid + 1) if 0 <= iid < len(self.item_options) - 1 else 0
             w["cmb"].current(idx)
-        t, a = M.SaveDoc.decode_mod(mod)
-        w["type_var"].set(t)
+        if is_equip:
+            t, a = M.SaveDoc.decode_mod(mod)   # 存档: (修饰符, 耐久/数量)
+        else:
+            t, a = mod, 0                      # 模板: 第二列 = 裸修饰符
+        w["type_var"].set(self._imod_text(t))
         w["amt_var"].set(a)
 
     def _tpl_inv(self, i, n):
@@ -1228,18 +1627,23 @@ class ViewerV2:
         for w in self.inv_rows + self.equip_rows:
             w["cmb"].config(state="normal")
         for k, w in enumerate(self.inv_rows):
-            self._set_row(w, inv[k])
+            self._set_row(w, inv[k], False)
         for k, w in enumerate(self.equip_rows):
-            self._set_row(w, eq[k])
+            self._set_row(w, eq[k], True)
         # 背包始终可编辑; 装备按条件
         for w in self.inv_rows:
             w["cmb"].config(state="readonly")
-            w["sp_t"].config(state="normal"); w["sp_a"].config(state="normal"); w["btn"].config(state="normal")
+            w["sp_t"].config(state="normal")
+            if w["sp_a"] is not None:
+                w["sp_a"].config(state="normal")
+            w["btn"].config(state="normal")
         cstate = "readonly" if eq_editable else "disabled"
         sstate = "normal" if eq_editable else "disabled"
         for w in self.equip_rows:
             w["cmb"].config(state=cstate); w["sp_t"].config(state=sstate)
-            w["sp_a"].config(state=sstate); w["btn"].config(state=sstate)
+            if w["sp_a"] is not None:
+                w["sp_a"].config(state=sstate)
+            w["btn"].config(state=sstate)
         self._update_inv_summary(i)
 
     def _update_inv_summary(self, i):
@@ -1256,17 +1660,15 @@ class ViewerV2:
         self.inv_summary.config(text=f"{tpl}   |   {eq}")
 
     def _collect_inv_flat(self):
-        """从 64 个背包行收集扁平 int 列表 (物品id/修饰符 成对)。"""
+        """从 64 个背包行收集扁平 int 列表 (物品id/修饰符 成对)。
+        模板第二列 = 裸修饰符枚举(不带耐久/数量) —— 旧版在这里写入 (数量<<8|类型) 会破坏 troops.txt。"""
         flat=[]
         for w in self.inv_rows:
             sel=w["cmb"].current()
             iid=-1 if (sel is None or sel<=0) else sel-1
             iid=max(-1, min(self.mod.nitems, iid))
-            try: t=max(0,min(255,int(w["type_var"].get() or 0)))
-            except Exception: t=0
-            try: a=max(0,min(16777215,int(w["amt_var"].get() or 0)))
-            except Exception: a=0
-            flat.append(iid); flat.append(M.SaveDoc.encode_mod(a, t))
+            flat.append(iid)
+            flat.append(self._parse_imod(w["type_var"].get()))
         return flat
 
     def _apply_slot(self, k, is_equip, item_sel=None):
@@ -1278,22 +1680,19 @@ class ViewerV2:
         # 合法性校验: 物品 id 必须在 [-1, nitems]
         item_id = -1 if (sel is None or sel <= 0) else sel - 1
         item_id = max(-1, min(self.mod.nitems, item_id))
-        try:
-            t = max(0, min(255, int(w["type_var"].get())))
-        except Exception:
-            t = 0
+        t = self._parse_imod(w["type_var"].get())
         try:
             a = max(0, min(16777215, int(w["amt_var"].get())))
         except Exception:
             a = 0
-        mod = M.SaveDoc.encode_mod(a, t)
+        mod = M.SaveDoc.encode_mod(a, t)   # 存档: (修饰符<<24) | 耐久/数量
         if is_equip:
             if not (self.doc is not None and self.doc.is_reliable(i)):
                 return
             try:
                 self.doc.set_equipment_slot(i, k, item_id, mod)
                 self._update_inv_summary(i)
-                self.set_status(f"已写入 #{i} 装备槽{k}: 物品={item_id} 类型={t} 数量={a}  (存档实例)")
+                self.set_status(f"已写入 #{i} 装备槽{k}: 物品={item_id} 修饰符={self._imod_text(t)} 耐久/数量={a}  (存档实例)")
             except Exception as ex:
                 self.set_status(f"写入失败: {ex}", err=True)
         else:
@@ -1302,7 +1701,7 @@ class ViewerV2:
                 flat = self._collect_inv_flat()
                 self.mod.set_troop_inventory(i, flat)
                 self._update_inv_summary(i)
-                self.set_status(f"已写入 #{i} 背包槽{k}: 物品={item_id} 类型={t} 数量={a}  (troops.txt 模板·未保存)")
+                self.set_status(f"已写入 #{i} 背包槽{k}: 物品={item_id} 修饰符={self._imod_text(t)}  (troops.txt 模板·未保存)")
             except Exception as ex:
                 self.set_status(f"写入失败: {ex}", err=True)
 
@@ -1312,7 +1711,7 @@ class ViewerV2:
             self.set_status("请先选中一个兵种。", err=True)
             return
         w = (self.equip_rows if is_equip else self.inv_rows)[k]
-        w["cmb"].current(0); w["type_var"].set(0); w["amt_var"].set(0)
+        w["cmb"].current(0); w["type_var"].set(self._imod_text(0)); w["amt_var"].set(0)
         if is_equip:
             if not (self.doc is not None and self.doc.is_reliable(i)):
                 self.set_status("装备槽需载档且兵种可靠才可清空。", err=True)
@@ -1325,6 +1724,10 @@ class ViewerV2:
         try:
             out = self.mod.save_module(backup=True)
             self.set_status(f"已保存模块并备份: {os.path.basename(str(out))}", ok=True)
+            try:
+                self.flag_hint.config(text="模板·已保存")
+            except Exception:
+                pass
             self._update_inv_summary(self.cur)
         except Exception as ex:
             messagebox.showerror("保存失败", str(ex))

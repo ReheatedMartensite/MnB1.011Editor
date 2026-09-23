@@ -25,6 +25,7 @@
   * 记录因 UTF-8 简介长度不同而对 4 字节不对齐 -> 必须逐字节(byte-by-byte)扫描.
 """
 import os
+import sys
 import json
 import struct
 import re
@@ -230,6 +231,18 @@ def initial_dir_for_module_dialog():
     return str(Path.home())
 
 
+# ---- 物品修饰符 (imod) 名称表 ----
+# 枚举 0..42, 与模组 languages/cns/item_modifiers.csv 及模块系统
+# header_item_modifiers.py 逐项一致 (2026-09-23 用全存档分布交叉验证)。
+# 存档槽位第二列 u32 = (imod << 24) | 耐久/数量; troops.txt 模板第二列 = 裸 imod。
+IMOD_NAMES = [
+    "普通", "破裂", "生锈", "弯曲", "有缺口", "凹陷", "粗劣", "粗糙", "陈旧", "廉价",
+    "优质", "精良", "锋利", "平衡", "回火", "致命", "精致", "极品", "重型", "坚硬",
+    "强有力", "破烂", "蓬乱", "粗制", "结实", "加厚", "加硬", "加强", "华丽", "豪华",
+    "瘸腿", "鞍背", "倔犟", "胆小", "温顺", "神骏", "一流", "新鲜", "隔夜", "隔两夜",
+    "发臭", "腐烂", "一大袋",
+]
+
 # ---- 固定字段偏移 (相对每条记录起点) ----
 OFF_ATTR   = 0x00          # 力量/敏捷/智力/魅力  4 x u32
 OFF_PROF   = 0x10          # 武器熟练 x7         7 x f32 (第7项恒 0.0)
@@ -405,6 +418,9 @@ class ModuleData:
         self.troops=[]
         self._inv_line_no=[]
         self._hdr_line_no=[]
+        self._attr_line_no=[]
+        self._prof_line_no=[]
+        self._skill_line_no=[]
         for g, lm in zip(groups, line_map):
             toks=g[0].split()
             if len(toks)<2: continue
@@ -425,9 +441,13 @@ class ModuleData:
                 skills=ints(g[4],6) if len(g)>4 else [],
                 line5=ints(g[5],8) if len(g)>5 else [],
             ))
-            # 每个兵种组: lm[0]=头行(含 flags, 用于 set_troop_flags), lm[1]=物品/装备行
+            # 每个兵种组: lm[0]=头行(含 flags, 用于 set_troop_flags), lm[1]=物品/装备行,
+            #            lm[2]=属性行, lm[3]=熟练行, lm[4]=技能行
             self._hdr_line_no.append(lm[0] if lm else None)
             self._inv_line_no.append(lm[1] if len(lm)>1 else None)
+            self._attr_line_no.append(lm[2] if len(lm)>2 else None)
+            self._prof_line_no.append(lm[3] if len(lm)>3 else None)
+            self._skill_line_no.append(lm[4] if len(lm)>4 else None)
         self._tpl_dirty=False
         ttrans=self._parse_trans(folder/"languages"/"cns"/"troops.csv")
         self.troop_names={t["tid"]:(ttrans.get(t["tid"]) or t["raw"]) for t in self.troops}
@@ -494,6 +514,53 @@ class ModuleData:
         self._raw_lines[ln]=" ".join(toks)+ending
         self.troops[idx]["flags"]=int(v) & 0xFFFFFFFF
         self._tpl_dirty=True
+
+    def _write_troop_int_line(self, idx, ln, values):
+        """把整数列表写回 troops.txt 中该兵种的某一行 (仅替换该行, 保留行尾/BOM)。"""
+        if ln is None: raise ValueError("该兵种缺少对应行, 无法写回")
+        ending=""
+        m=re.search(r"(\r?\n)$", self._raw_lines[ln])
+        if m: ending=m.group(1)
+        self._raw_lines[ln]=" ".join(str(int(x)) for x in values)+ending
+        self._tpl_dirty=True
+
+    def set_troop_attrs(self, idx, vals):
+        """写回属性行: 力/敏/智/魅/等级 共 5 个整数 (troops.txt 模板, 影响新开局)。"""
+        if not (0<=idx<len(self.troops)): raise IndexError("troop idx")
+        vals=[int(x) for x in vals]
+        if len(vals)!=5: raise ValueError("需要 5 个整数: 力/敏/智/魅/等级")
+        self._write_troop_int_line(idx, self._attr_line_no[idx], vals)
+        self.troops[idx]["attrs"]=list(vals)
+
+    def set_troop_profs(self, idx, vals):
+        """写回武器熟练行: 单手/双手/长杆/弓/弩/投掷/火器 共 7 个整数。"""
+        if not (0<=idx<len(self.troops)): raise IndexError("troop idx")
+        vals=[int(x) for x in vals]
+        if len(vals)!=7: raise ValueError("需要 7 个整数 (7 项武器熟练)")
+        self._write_troop_int_line(idx, self._prof_line_no[idx], vals)
+        self.troops[idx]["profs"]=list(vals)
+
+    def set_troop_skill_level(self, idx, pos, level):
+        """设置单个技能等级 (troops.txt 模板技能行, 位域 48 位: 每技能 4bit)。
+        pos: 技能位置 0..47 (与 skills.txt 顺序一致); level: 0..15 (游戏内上限一般 10)。"""
+        if not (0<=idx<len(self.troops)): raise IndexError("troop idx")
+        if not (0<=int(pos)<48): raise ValueError("技能位置 0..47")
+        if not (0<=int(level)<=15): raise ValueError("技能等级 0..15")
+        words=[int(x) & 0xFFFFFFFF for x in (self.troops[idx].get("skills") or [])]
+        while len(words)<6: words.append(0)
+        words[int(pos)//8] = (words[int(pos)//8] & ~(0xF << ((int(pos)%8)*4)) & 0xFFFFFFFF) \
+                             | ((int(level) & 0xF) << ((int(pos)%8)*4))
+        self._write_troop_int_line(idx, self._skill_line_no[idx], words)
+        self.troops[idx]["skills"]=words
+
+    def set_troop_skills(self, idx, words):
+        """写回整个技能行 (6 个 u32 打包位域)。words: 长度 6 的整数列表。
+        等价于旧版查看器的『应用技能行』, 一次改写全部 48 个技能等级。"""
+        if not (0<=idx<len(self.troops)): raise IndexError("troop idx")
+        if len(words)!=6: raise ValueError("需要 6 个整数 (技能行 6 词)")
+        w=[int(x) & 0xFFFFFFFF for x in words]
+        self._write_troop_int_line(idx, self._skill_line_no[idx], w)
+        self.troops[idx]["skills"]=w
 
     def save_module(self, backup=True):
         """把模板改动写回 troops.txt (抽象兵种/模组层修改, 影响新开局)。
@@ -1833,14 +1900,20 @@ class SaveDoc:
         self.dirty=False
         return out
 
-    # ---- 修饰符编解码(用于显示, 实际存储为原始 u32) ----
+    # ---- 修饰符编解码 ----
+    # 存档槽位第二列 u32 = (修饰符 imod << 24) | 耐久/数量。
+    #   imod 0..42 = 物品修饰符枚举(见模块级 IMOD_NAMES);
+    #   低 24 位: 马匹=当前生命, 盾牌=当前耐久, 食物等货物=当前数量, 其余物品=0。
+    # troops.txt 模板第二列 = 裸的 imod 枚举(不带耐久), WD 模板全为 0。
+    # 旧实现按 (低8位=类型, 高24位=数量) 解码是错误猜测, 2026-09-23 已用
+    # 全存档 11124 个槽位的分布 + cns/item_modifiers.csv 证伪并修正。
     @staticmethod
     def decode_mod(mod):
-        return (mod & 0xFF, mod >> 8)   # (类型, 数量猜测)
+        return (mod >> 24, mod & 0xFFFFFF)   # (修饰符 imod, 耐久/数量)
 
     @staticmethod
-    def encode_mod(amount, mtype):
-        return ((int(amount) & 0xFFFFFF) << 8) | (int(mtype) & 0xFF)
+    def encode_mod(amount, imod):
+        return ((int(imod) & 0xFF) << 24) | (int(amount) & 0xFFFFFF)
 
 def _pause(msg=""):
     """打印信息后等待回车 —— 避免双击运行时"一闪而过"; 随后结束进程。"""

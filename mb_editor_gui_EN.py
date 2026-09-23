@@ -1038,17 +1038,17 @@ class App(tk.Tk):
         ttk.Label(r, text="Slot %02d" % k, width=6).pack(side="left")
         cmb = ttk.Combobox(r, values=self.item_options, width=46, state="readonly")
         cmb.pack(side="left", padx=2)
-        ttk.Label(r, text="Modifier", width=5).pack(side="left")
+        ttk.Label(r, text="Raw mod", width=7).pack(side="left")
         mod_var = tk.StringVar()
         mod_ent = ttk.Entry(r, textvariable=mod_var, width=12)
         mod_ent.pack(side="left", padx=2)
-        dec = ttk.Label(r, text="", width=22)
+        dec = ttk.Label(r, text="", width=26)
         dec.pack(side="left", padx=2)
         ttype = tk.IntVar(); tamount = tk.IntVar()
-        ttk.Label(r, text="Type").pack(side="left")
+        ttk.Label(r, text="Modifier").pack(side="left")
         sp_t = ttk.Spinbox(r, from_=0, to=255, width=5, textvariable=ttype)
         sp_t.pack(side="left", padx=1)
-        ttk.Label(r, text="Count").pack(side="left")
+        ttk.Label(r, text="Dur/Count").pack(side="left")
         sp_a = ttk.Spinbox(r, from_=0, to=16777215, width=9, textvariable=tamount)
         sp_a.pack(side="left", padx=1)
         btn = ttk.Button(r, text="Clear", command=lambda k=k: self.clear_slot(k, is_equip))
@@ -1063,7 +1063,8 @@ class App(tk.Tk):
             except Exception: return
             self.apply_slot(k, is_equip, modifier=m)
         def on_type_amt(*a):
-            m = ((tamount.get() & 0xFFFFFF) << 8) | (ttype.get() & 0xFF)
+            # save dword = (modifier << 24) | durability/count
+            m = ((ttype.get() & 0xFF) << 24) | (tamount.get() & 0xFFFFFF)
             mod_var.set(str(m))
             self.apply_slot(k, is_equip, modifier=m)
         cmb.bind("<<ComboboxSelected>>", on_item)
@@ -1107,9 +1108,15 @@ class App(tk.Tk):
             else:
                 w["cmb"].current(0)
         w["mod_var"].set(str(mod))
-        w["ttype"].set(mod & 0xFF)
-        w["tamount"].set((mod >> 8) & 0xFFFFFF)
-        w["dec"].config(text="(type=%d, count=%d)" % (mod & 0xFF, (mod >> 8) & 0xFFFFFF))
+        self._show_mod_decode(w, mod)
+
+    def _show_mod_decode(self, w, mod):
+        """save dword = (modifier imod << 24) | durability/count."""
+        mt, amt = (mod >> 24) & 0xFF, mod & 0xFFFFFF
+        nm = M.IMOD_NAMES[mt] if 0 <= mt < len(M.IMOD_NAMES) else "?"
+        w["ttype"].set(mt)
+        w["tamount"].set(amt)
+        w["dec"].config(text="(modifier=%d %s, dur/count=%d)" % (mt, nm, amt))
 
     def apply_slot(self, k, is_equip, item_id=None, modifier=None):
         if not self._can_edit(): return
@@ -1125,9 +1132,7 @@ class App(tk.Tk):
             self.doc.set_equipment_slot(self.cur_idx, k, cur_id, cur_mod)
         else:
             self.doc.set_inventory_slot(self.cur_idx, k, cur_id, cur_mod)
-        w["ttype"].set(cur_mod & 0xFF)
-        w["tamount"].set((cur_mod >> 8) & 0xFFFFFF)
-        w["dec"].config(text="(type=%d, count=%d)" % (cur_mod & 0xFF, (cur_mod >> 8) & 0xFFFFFF))
+        self._show_mod_decode(w, cur_mod)
 
     def clear_slot(self, k, is_equip):
         if self.cur_idx is None: return
@@ -1387,7 +1392,12 @@ def _parse_module_arg(argv):
     return None
 
 
-if __name__ == "__main__":
+def main(argv=None):
+    """Called directly by the frozen launcher (no longer depends on __main__)."""
     enable_dpi_awareness()   # fixes high-DPI text drift / click offset
-    app = App(module_arg=_parse_module_arg(sys.argv[1:]))
+    app = App(module_arg=_parse_module_arg(argv if argv is not None else sys.argv[1:]))
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

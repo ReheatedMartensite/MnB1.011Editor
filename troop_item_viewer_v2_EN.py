@@ -264,6 +264,103 @@ def item_categories(it):
     return is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing
 
 
+# ---- Damage encoding: raw <256 = cut, +256 = pierce, +512 = blunt (inverse of decode_damage) ----
+DMG_KINDS = ("Cut", "Pierce", "Blunt")
+_DMG_OFF = {"Cut": 0, "Pierce": 256, "Blunt": 512}
+
+
+def split_damage(raw):
+    """Raw damage value -> (amount, kind); inverse of decode_damage."""
+    if raw is None:
+        return 0, "Cut"
+    if raw >= 512:
+        return raw - 512, "Blunt"
+    if raw >= 256:
+        return raw - 256, "Pierce"
+    return raw, "Cut"
+
+
+def encode_damage(val, kind):
+    """(amount, kind) -> raw damage value."""
+    try:
+        v = int(val)
+    except Exception:
+        v = 0
+    if v < 0:
+        v = 0
+    return v + _DMG_OFF.get(kind, 0)
+
+
+def item_attr_fields(it):
+    """Per-item-type readable labels for each position of it['stats'].
+
+    Single source of truth for the attribute editor.
+    Returns [(absolute index, label, is_damage_field)]. Labels follow the same
+    grouping as format_item, so fill() and apply() can never drift apart.
+    """
+    stats = it["stats"]
+    n = len(stats)
+    is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = item_categories(it)
+    spec = []
+
+    def add(idx, label, dmg=False):
+        if 0 <= idx < n:
+            spec.append((idx, label, dmg))
+
+    # First four are common to every item; only their meaning changes per type.
+    if n >= 4:
+        add(0, "Goods quantity" if is_goods else "Head armor")
+        add(1, "Horse defense" if is_horse else ("Shield resistance" if is_shield else "Body armor"))
+        add(2, "Accuracy" if (is_ranged or is_ammo or is_throwing) else "Leg armor")
+        add(3, "Requirement / difficulty")
+
+    if is_horse and n >= 10:
+        add(4, "HP")
+        add(5, "Horse speed")
+        add(6, "Maneuver")
+        add(7, "Field 7")
+        add(9, "Charge")
+
+    if is_shield and n >= 8:
+        add(4, "Durability")
+        add(5, "Shield speed")
+        add(7, "Size")
+
+    # Ammo/weapon fields use negative indexes -> convert to absolute.
+    if is_ammo and n >= 11:
+        add(n - 4, "Length/model scale")
+        add(n - 3, "Count")
+        add(n - 2, "Damage", True)
+
+    weapon_like = (
+        not is_goods
+        and not is_horse
+        and not is_shield
+        and not is_ammo
+        and n >= 11
+        and ((stats[5] not in (None, 0)) or (stats[-2] not in (None, 0)) or (stats[-1] not in (None, 0)))
+    )
+    if weapon_like:
+        add(n - 6, "Weapon speed")
+        if is_ranged or is_throwing:
+            add(n - 5, "Missile speed")
+        else:
+            add(n - 4, "Reach / length")
+        if is_throwing:
+            add(n - 3, "Count")
+        add(n - 2, "Damage 1", True)
+        add(n - 1, "Damage 2", True)
+
+    # Keep only the first label per index, so no duplicate rows are generated.
+    out, seen = [], set()
+    for idx, label, dmg in spec:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append((idx, label, dmg))
+    return out
+
+
 class ScrolledFrame(ttk.Frame):
     """内部放一个可垂直滚动的 Frame (用于 74 行Items槽网格)。"""
     def __init__(self, master, **kw):
@@ -392,12 +489,13 @@ class ViewerV2:
         sb.config(command=self.tlist.yview)
         self.tlist.bind("<<ListboxSelect>>", self.on_troop_select)
 
-        # 右侧: 上=Summary, 下=技能表
+        # 右侧: 多面板 (各独立, 互不挤压)
         vp = tk.PanedWindow(rf, orient="vertical")
         vp.pack(fill="both", expand=True)
 
-        gf = ttk.LabelFrame(vp, text="Summary")
-        vp.add(gf, stretch="always", height=250)
+        # 1) Summary / Flags(tf_*) checkbox editor —— edits troops.txt template (affects new games)
+        gf = ttk.LabelFrame(vp, text="Summary / Flags tf_*")
+        vp.add(gf, stretch="always", height=320)
         # 阵营(跳槽)编辑栏: 修改存档中该Troops的当前所属阵营
         facbar = ttk.Frame(gf)
         facbar.pack(side="top", fill="x", padx=4, pady=2)
@@ -412,30 +510,73 @@ class ViewerV2:
         self.fac_hint.pack(side="left", padx=6)
         # Flag位(tf_*)勾选编辑面板: 修改 troops.txt 抽象Troops头行的 flags (影响新开局)
         # 程序在「勾选项 ↔ 数值」之间自动转换, 用户无需理解每一位代表什么。
-        flf = ttk.LabelFrame(gf, text="Flags tf_* (check to set; value computed automatically)")
-        flf.pack(side="top", fill="x", padx=4, pady=2)
-        self.flag_calc = ttk.Label(flf, text="Current value: 0x00000000 (decimal 0)", foreground="#555")
-        self.flag_calc.pack(side="top", fill="x", padx=6, pady=(3, 0))
-        fgrid = ttk.Frame(flf)
-        fgrid.pack(side="top", fill="x", padx=6, pady=2)
-        self.tf_vars = []          # [(mask, BooleanVar), ...], 顺序同 M.TF_NAMES
-        for k, (mask, name) in enumerate(M.TF_NAMES):
-            var = tk.BooleanVar()
-            cb = ttk.Checkbutton(fgrid, text=name, variable=var,
-                                 command=self._update_troop_flag_calc)
-            cb.grid(row=k // 3, column=k % 3, sticky="w", padx=4, pady=1)
-            self.tf_vars.append((mask, var))
+        flf = ttk.LabelFrame(gf, text="Flags tf_* (checking writes to template; click 'Save module' to write to disk)")
+        flf.pack(side="top", fill="both", expand=True, padx=4, pady=2)
+        # NOTE: pack the button row (bottom side) BEFORE the rest, so the packer always
+        # reserves room for it even when the pane is squeezed (historical bug: it collapsed to 1px).
         fbbar = ttk.Frame(flf)
-        fbbar.pack(side="top", fill="x", padx=6, pady=(2, 4))
+        fbbar.pack(side="bottom", fill="x", padx=6, pady=(2, 4))
         ttk.Button(fbbar, text="Apply flags", command=self.on_troop_flag).pack(side="left", padx=2)
         self.flag_hint = ttk.Label(fbbar, text="Template · unsaved", foreground="#888")
         self.flag_hint.pack(side="left", padx=6)
-        self.tdetail = self._mk_text(gf)
+        self.flag_calc = ttk.Label(flf, text="Current value: 0x00000000 (decimal 0)", foreground="#555")
+        self.flag_calc.pack(side="top", fill="x", padx=6, pady=(3, 0))
+        fgrid = ttk.Frame(flf)
+        fgrid.pack(side="top", fill="both", expand=True, padx=6, pady=2)
+        self.tf_vars = []          # [(mask, BooleanVar), ...], 顺序同 M.TF_NAMES
+        for k, (mask, name) in enumerate(M.TF_NAMES):
+            var = tk.BooleanVar()
+            # checking the box writes to the template immediately (see _on_tf_toggle)
+            cb = ttk.Checkbutton(fgrid, text=name, variable=var,
+                                 command=self._on_tf_toggle)
+            cb.grid(row=k // 5, column=k % 5, sticky="w", padx=4, pady=1)
+            self.tf_vars.append((mask, var))
 
-        sf = ttk.LabelFrame(vp, text="Skills (mapped by skills.txt position; 48-slot bitfield)")
-        vp.add(sf, stretch="always", height=330)
+        # 2) Troop detail (decoded text, own scrollable pane) —— attributes/profs/skills all visible
+        df = ttk.LabelFrame(vp, text="Troop detail (decoded)")
+        vp.add(df, stretch="always", height=150)
+        self.tdetail = self._mk_text(df, height=12)
+
+        # 3) Attributes / Proficiencies (editable) —— restore old viewer's per-field editing
+        af = ttk.LabelFrame(vp, text="Attributes / Proficiencies (editable; applies on Save module)")
+        vp.add(af, stretch="always", height=130)
+        arow = ttk.Frame(af)
+        arow.pack(side="top", fill="x", padx=4, pady=2)
+        self.edit_attr_vars = []
+        for lbl in ("STR", "AGI", "INT", "CHA", "LVL"):
+            ttk.Label(arow, text=lbl).pack(side="left", padx=(4, 0))
+            v = tk.StringVar()
+            self.edit_attr_vars.append(v)
+            ttk.Entry(arow, textvariable=v, width=5).pack(side="left", padx=(0, 5))
+        ttk.Button(arow, text="Apply attributes", command=self.apply_troop_attrs).pack(side="left", padx=6)
+        prow = ttk.Frame(af)
+        prow.pack(side="top", fill="x", padx=4, pady=2)
+        ttk.Label(prow, text="Prof:").pack(side="left")
+        self.edit_prof_vars = []
+        for lbl in ("1H", "2H", "Pole", "Bow", "XBow", "Throw", "Fire"):
+            ttk.Label(prow, text=lbl).pack(side="left", padx=(4, 0))
+            v = tk.StringVar()
+            self.edit_prof_vars.append(v)
+            ttk.Entry(prow, textvariable=v, width=4).pack(side="left", padx=(0, 4))
+        ttk.Button(prow, text="Apply proficiencies", command=self.apply_troop_profs).pack(side="left", padx=6)
+
+        # 4) Skills (display + editable) —— restore old viewer's skill-line editing, keep tpl/sav table
+        sf = ttk.LabelFrame(vp, text="Skills (mapped by skills.txt position; 48-slot bitfield, editable)")
+        vp.add(sf, stretch="always", height=250)
+        # NOTE: pack the skill-edit row (bottom side) FIRST so its entries/buttons survive
+        # pane squeezing (historical bug: the row collapsed to 1px -> "skills not editable").
+        skedit = ttk.Frame(sf)
+        skedit.pack(side="bottom", fill="x", padx=4, pady=2)
+        ttk.Label(skedit, text="Selected level:").pack(side="left")
+        self.edit_skill_lv_var = tk.StringVar(value="0")
+        ttk.Entry(skedit, textvariable=self.edit_skill_lv_var, width=5).pack(side="left", padx=(0, 4))
+        ttk.Button(skedit, text="Apply selected", command=self.apply_troop_skill_selected).pack(side="left", padx=4)
+        ttk.Label(skedit, text="Whole line (6 words, hex ok):").pack(side="left", padx=(12, 0))
+        self.edit_skill_raw_var = tk.StringVar()
+        ttk.Entry(skedit, textvariable=self.edit_skill_raw_var, width=46).pack(side="left", padx=(0, 4))
+        ttk.Button(skedit, text="Apply skill line", command=self.apply_troop_skills_raw).pack(side="left", padx=4)
         cols = ("pos", "id", "name", "tpl", "sav")
-        self.skill_tv = ttk.Treeview(sf, columns=cols, show="headings", height=14)
+        self.skill_tv = ttk.Treeview(sf, columns=cols, show="headings", height=8)
         for c, w, t in (("pos", 50, "Position"), ("id", 210, "Skill ID"),
                         ("name", 110, "Chinese"), ("tpl", 60, "Template"), ("sav", 60, "Save")):
             self.skill_tv.heading(c, text=t)
@@ -446,9 +587,11 @@ class ViewerV2:
         self.skill_tv.pack(fill="both", expand=True)
         self.skill_tv.tag_configure("nz", background="#d9f2d9")
         self.skill_tv.tag_configure("diff", background="#ffe0e0")
+        self.skill_tv.bind("<<TreeviewSelect>>", self._on_skill_select)
 
+        # 5) Inventory / Equipment (editable) —— kept (the always-available save path)
         ef = ttk.LabelFrame(vp, text="Inventory / Equipment (editable)")
-        vp.add(ef, stretch="always", height=240)
+        vp.add(ef, stretch="always", height=220)
         hdr = ttk.Frame(ef)
         hdr.pack(side="top", fill="x", padx=4, pady=2)
         self.inv_summary = ttk.Label(hdr, text="Backpack = template · Equipment = instance", anchor="w")
@@ -487,10 +630,11 @@ class ViewerV2:
         rvp = tk.PanedWindow(rf, orient="vertical")
         rvp.pack(fill="both", expand=True)
         det_f = ttk.LabelFrame(rvp, text="Item details (decoded)")
-        rvp.add(det_f, stretch="always", height=360)
+        rvp.add(det_f, stretch="always", height=300)
         self.idetail = self._mk_text(det_f)
         ed_f = ttk.LabelFrame(rvp, text="Attributes (editable; applied when saving items)")
-        rvp.add(ed_f, stretch="always", height=170)
+        # Must fit: basic row + stats row + per-field attributes (up to ~9 rows) + two button rows
+        rvp.add(ed_f, stretch="always", height=350)
         ef = ttk.Frame(ed_f); ef.pack(fill="x", padx=4, pady=2)
         ttk.Label(ef, text="Price:").pack(side="left")
         self.edit_price_var = tk.StringVar()
@@ -508,6 +652,18 @@ class ViewerV2:
         ttk.Entry(sf, textvariable=self.edit_stats_var).pack(side="left", fill="x", expand=True, padx=(0, 4))
         ttk.Button(sf, text="Apply stats", command=self.apply_item_stats).pack(side="left", padx=4)
 
+        # Per-field attribute editor: labels follow the item type (mirrors the detail pane above)
+        af = ttk.LabelFrame(ed_f, text="Per-field attributes (auto-detected from item type)")
+        af.pack(fill="x", padx=4, pady=2)
+        self.attr_rows = ttk.Frame(af)
+        self.attr_rows.pack(fill="x")
+        ab = ttk.Frame(af)
+        ab.pack(fill="x", padx=4, pady=2)
+        ttk.Button(ab, text="Apply attributes", command=self.apply_item_attrs).pack(side="left")
+        ttk.Label(ab, text="(writes back the matching stats positions; others are left untouched)",
+                  foreground="#666").pack(side="left", padx=6)
+        self.attr_widgets = []
+
     def build_compare_tab(self):
         top = ttk.Frame(self.tab_cmp)
         top.pack(fill="x", padx=4, pady=3)
@@ -515,12 +671,13 @@ class ViewerV2:
         ttk.Button(top, text="Run comparison", command=self.run_compare).pack(side="left", padx=6)
         self.cmp_detail = self._mk_text(self.tab_cmp, expand=True)
 
-    def _mk_text(self, parent, expand=True):
+    def _mk_text(self, parent, expand=True, height=None):
         f = ttk.Frame(parent)
         f.pack(fill="both", expand=True)
         sb = ttk.Scrollbar(f)
         sb.pack(side="right", fill="y")
-        t = tk.Text(f, wrap="word", font=("Microsoft YaHei UI", 9), yscrollcommand=sb.set)
+        kw = {"height": height} if height else {}
+        t = tk.Text(f, wrap="word", font=("Microsoft YaHei UI", 9), yscrollcommand=sb.set, **kw)
         t.pack(fill="both", expand=True)
         sb.config(command=t.yview)
         t.tag_configure("diff", foreground="#c0392b")
@@ -576,7 +733,7 @@ class ViewerV2:
         if getattr(self, "_inv_built", False):
             for w in self.inv_rows + self.equip_rows:
                 try:
-                    w["cmb"].current(0); w["type_var"].set(0); w["amt_var"].set(0)
+                    w["cmb"].current(0); w["type_var"].set(self._imod_text(0)); w["amt_var"].set(0)
                     w["cmb"].config(state="disabled"); w["sp_t"].config(state="disabled")
                     w["sp_a"].config(state="disabled"); w["btn"].config(state="disabled")
                 except Exception:
@@ -750,15 +907,18 @@ class ViewerV2:
         except Exception:
             pass
 
-    def on_troop_flag(self):
-        """改写Troops头行 flags (troops.txt 模板, 影响新开局)。
-        数值由勾选的 tf_* 项自动按位或计算; 不在勾选表里的未知位原样保留。"""
+    def _commit_troop_flags(self, report=True):
+        """Write the current checkbox state into the template flags (troops.txt header line).
+        value = (unknown bits kept from the original) | (checked tf_* bits).
+        Returns the written int, or None on failure / no selection."""
         if self.cur is None:
-            self.set_status("Please select a troop first.", err=True)
-            return
+            if report:
+                self.set_status("Please select a troop first.", err=True)
+            return None
         if not getattr(self, "tf_vars", None):
-            self.set_status("Flags panel not yet initialized.", err=True)
-            return
+            if report:
+                self.set_status("Flags panel not yet initialized.", err=True)
+            return None
         known_all = 0
         for mask, _ in self.tf_vars:
             known_all |= mask
@@ -770,10 +930,147 @@ class ViewerV2:
         try:
             self.mod.set_troop_flags(self.cur, v)
         except Exception as ex:
+            if report:
+                self.set_status(f"Write failed: {ex}", err=True)
+            return None
+        try:
+            self.flag_hint.config(text="Template · unsaved")
+        except Exception:
+            pass
+        if report:
+            self.set_status(
+                f"Flags changed to 0x{v & 0xFFFFFFFF:08X} (template change; click 'Save module' to apply)", ok=True)
+        return v
+
+    def _on_tf_toggle(self):
+        """Checkbox callback: writes to the template immediately and refreshes the value label."""
+        self._update_troop_flag_calc()
+        if self.cur is not None:
+            self._commit_troop_flags()
+
+    def on_troop_flag(self):
+        """'Apply flags' button: same commit path as the immediate checkbox write (redundant entry point)."""
+        v = self._commit_troop_flags()
+        if v is not None:
+            self.show_troop(self.cur)
+
+    # ---- Attributes / Proficiencies / Skills editing (restore old viewer's per-field editing) ----
+    def apply_troop_attrs(self):
+        """Edit template attribute line: STR/AGI/INT/CHA/Level (troops.txt, affects new games)."""
+        if self.cur is None:
+            self.set_status("Please select a troop first.", err=True)
+            return
+        vals = []
+        for v in self.edit_attr_vars:
+            s = (v.get() or "").strip()
+            try:
+                vals.append(int(s))
+            except Exception:
+                self.set_status("Attributes must be integers (STR/AGI/INT/CHA/Level).", err=True)
+                return
+        if len(vals) != 5:
+            self.set_status("Need 5 integers.", err=True)
+            return
+        try:
+            self.mod.set_troop_attrs(self.cur, vals)
+        except Exception as ex:
             self.set_status(f"Write failed: {ex}", err=True)
             return
         self.show_troop(self.cur)
-        self.set_status(f"Flags changed to 0x{v & 0xFFFFFFFF:08X} (template change; click 'Save module' to apply)", ok=True)
+        self.set_status("Attributes updated (template change; click 'Save module' to apply)", ok=True)
+
+    def apply_troop_profs(self):
+        """Edit template weapon proficiency line: 1H/2H/Pole/Bow/XBow/Throw/Fire."""
+        if self.cur is None:
+            self.set_status("Please select a troop first.", err=True)
+            return
+        vals = []
+        for v in self.edit_prof_vars:
+            s = (v.get() or "").strip()
+            try:
+                vals.append(int(s))
+            except Exception:
+                self.set_status("Proficiencies must be integers.", err=True)
+                return
+        if len(vals) != 7:
+            self.set_status("Need 7 integers (1H/2H/Pole/Bow/XBow/Throw/Fire).", err=True)
+            return
+        try:
+            self.mod.set_troop_profs(self.cur, vals)
+        except Exception as ex:
+            self.set_status(f"Write failed: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status("Proficiencies updated (template change; click 'Save module' to apply)", ok=True)
+
+    @staticmethod
+    def _parse_hex_or_dec(s):
+        s = (s or "").strip()
+        if not s:
+            return 0
+        if s.lower().startswith("0x"):
+            return int(s, 16)
+        return int(s)
+
+    def _on_skill_select(self, ev=None):
+        sel = self.skill_tv.selection()
+        if not sel:
+            return
+        vals = self.skill_tv.item(sel[0], "values")
+        if not vals:
+            return
+        try:
+            self.edit_skill_lv_var.set(str(int(vals[3])))
+        except Exception:
+            self.edit_skill_lv_var.set("0")
+
+    def apply_troop_skill_selected(self):
+        """Edit a single skill level (48-slot bitfield: 4 bits per skill, position 0..47)."""
+        if self.cur is None:
+            self.set_status("Please select a troop first.", err=True)
+            return
+        sel = self.skill_tv.selection()
+        if not sel:
+            self.set_status("Please select a skill row first.", err=True)
+            return
+        pos = int(self.skill_tv.item(sel[0], "values")[0])
+        try:
+            lv = int((self.edit_skill_lv_var.get() or "0").strip())
+        except Exception:
+            self.set_status("Level must be an integer (0..15).", err=True)
+            return
+        if not (0 <= lv <= 15):
+            self.set_status("Skill level must be in 0..15.", err=True)
+            return
+        try:
+            self.mod.set_troop_skill_level(self.cur, pos, lv)
+        except Exception as ex:
+            self.set_status(f"Write failed: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status(f"Skill #{pos} set to {lv} (template change; click 'Save module' to apply)", ok=True)
+
+    def apply_troop_skills_raw(self):
+        """Edit the whole skill line (6 packed u32 words; hex supported). Equivalent to old 'Apply skill line'."""
+        if self.cur is None:
+            self.set_status("Please select a troop first.", err=True)
+            return
+        parts = (self.edit_skill_raw_var.get() or "").split()
+        try:
+            words = [self._parse_hex_or_dec(p) & 0xFFFFFFFF for p in parts]
+        except Exception:
+            self.set_status("Skill line contains an invalid integer/hex value.", err=True)
+            return
+        if len(words) != 6:
+            self.set_status("Skill line needs 6 integers (one u32 per word).", err=True)
+            return
+        try:
+            self.mod.set_troop_skills(self.cur, words)
+        except Exception as ex:
+            self.set_status(f"Write failed: {ex}", err=True)
+            return
+        self.show_troop(self.cur)
+        self.set_status("Skill line updated (template change; click 'Save module' to apply)", ok=True)
 
     def show_troop(self, i):
         t = self.mod.troops[i]
@@ -853,6 +1150,18 @@ class ViewerV2:
             if sav is not None and sav[j] != v:
                 tags = ("diff",)
             self.skill_tv.insert("", "end", values=(j, sid, sname, v, sv), tags=tags)
+
+        # 填充属性/熟练编辑框 (还原旧版查看器的逐项编辑)
+        a = t.get("attrs", [])
+        for k, v in enumerate(self.edit_attr_vars):
+            v.set(fmt(a[k]) if k < len(a) else "")
+        p = t.get("profs", [])
+        for k, v in enumerate(self.edit_prof_vars):
+            v.set(fmt(p[k]) if k < len(p) else "")
+        # 技能整行(默认16进制)
+        sw = t.get("skills", [])
+        self.edit_skill_raw_var.set(" ".join("0x%x" % (int(x) & 0xFFFFFFFF) for x in sw))
+        self.edit_skill_lv_var.set("0")
 
         # 阵营下拉: 载入存档且Troops可靠时可改(即领主跳槽)
         self._sync_faction_combo(i)
@@ -963,7 +1272,7 @@ class ViewerV2:
         lines = []
         name = self._item_full_name(it)
         stats = it["stats"]
-        is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = self.item_categories(it)
+        is_goods, is_horse, is_shield, is_ammo, is_ranged, is_throwing = item_categories(it)
 
         lines.append(f"Name: {name}")
         lines.append(f"Item ID: {it['id']}")
@@ -1071,6 +1380,66 @@ class ViewerV2:
         self.edit_weight_var.set(fmt(it["weight"]))
         self.edit_abundance_var.set(fmt(it["abundance"]))
         self.edit_stats_var.set(" ".join(fmt(x) for x in it["stats"]))
+        self._build_attr_rows(it)
+
+    def _build_attr_rows(self, it):
+        """Rebuild the per-field attribute rows for this item type (labels from item_attr_fields)."""
+        for w in self.attr_rows.winfo_children():
+            w.destroy()
+        self.attr_widgets = []
+        stats = it["stats"]
+        for idx, label, dmg in item_attr_fields(it):
+            row = ttk.Frame(self.attr_rows)
+            row.pack(fill="x", padx=4, pady=1)
+            ttk.Label(row, text=label, width=18, anchor="w").pack(side="left")
+            raw = stats[idx]
+            if dmg:
+                val, kind = split_damage(raw)
+                var = tk.StringVar(value=str(val))
+                ttk.Entry(row, textvariable=var, width=8).pack(side="left")
+                kv = tk.StringVar(value=kind)
+                ttk.Combobox(row, values=list(DMG_KINDS), width=8, state="readonly",
+                             textvariable=kv).pack(side="left", padx=2)
+                self.attr_widgets.append((idx, label, var, kv))
+            else:
+                var = tk.StringVar(value=fmt(raw))
+                ttk.Entry(row, textvariable=var, width=10).pack(side="left")
+                self.attr_widgets.append((idx, label, var, None))
+
+    def apply_item_attrs(self):
+        """Write the per-field attribute edits back into stats (only the listed indexes)."""
+        if self.cur_item is None or not (0 <= self.cur_item < len(self.items_full)):
+            return
+        it = self.items_full[self.cur_item]
+        stats = list(it["stats"])
+        bad, updates = [], {}
+        for idx, label, var, kv in self.attr_widgets:
+            raw = var.get().strip()
+            try:
+                v = int(raw)
+            except ValueError:
+                bad.append(label)
+                continue
+            if kv is not None:          # damage field: amount + kind -> raw encoding
+                if v < 0:
+                    bad.append(label)
+                    continue
+                v = encode_damage(v, kv.get())
+            updates[idx] = v
+        if bad:
+            messagebox.showwarning("Input error",
+                                   "These attributes must be integers: " + ", ".join(sorted(set(bad))))
+            return
+        if not updates:
+            return
+        for idx, v in updates.items():
+            if idx < len(stats):
+                stats[idx] = v
+        it["stats"] = stats
+        self.item_dirty = True
+        self._fill_item_edit(it)
+        self._set(self.idetail, self.format_item(it))
+        self.set_status("Item attributes modified (not saved yet)")
 
     def apply_item_basic(self):
         if self.cur_item is None or not (0 <= self.cur_item < len(self.items_full)):
@@ -1166,6 +1535,28 @@ class ViewerV2:
         self.equip_rows = [self._make_inv_row(parent, k, True) for k in range(M.EQUIP_SLOTS)]
         self._inv_built = True
 
+    # ---- Modifier (imod) dropdown helpers ----
+    # Semantics verified against the full save + item_modifiers.csv:
+    #   save slot 2nd dword = (modifier << 24) | durability/count;
+    #   troops.txt template 2nd value = bare modifier enum (0=Plain, 18=Heavy, 42=Large bag...).
+    def _imod_options(self):
+        return ["%d %s" % (i, n) for i, n in enumerate(M.IMOD_NAMES)]
+
+    def _imod_text(self, v):
+        try:
+            v = int(v)
+        except Exception:
+            return "0"
+        if 0 <= v < len(M.IMOD_NAMES):
+            return "%d %s" % (v, M.IMOD_NAMES[v])
+        return str(v)
+
+    def _parse_imod(self, s):
+        try:
+            return max(0, min(255, int(str(s).strip().split()[0])))
+        except Exception:
+            return 0
+
     def _make_inv_row(self, parent, k, is_equip):
         r = ttk.Frame(parent)
         r.pack(fill="x", padx=6, pady=1)
@@ -1173,14 +1564,18 @@ class ViewerV2:
         ttk.Label(r, text=label, width=8).pack(side="left")
         cmb = ttk.Combobox(r, values=self.item_options, width=42, state="readonly")
         cmb.pack(side="left", padx=2)
-        ttk.Label(r, text="Type").pack(side="left")
-        type_var = tk.IntVar(value=0)
-        sp_t = ttk.Spinbox(r, from_=0, to=255, width=5, textvariable=type_var)
+        ttk.Label(r, text="Mod").pack(side="left")
+        type_var = tk.StringVar(value=self._imod_text(0))
+        sp_t = ttk.Combobox(r, values=self._imod_options(), width=11,
+                            textvariable=type_var)   # editable: raw numbers accepted too
         sp_t.pack(side="left", padx=1)
-        ttk.Label(r, text="Count").pack(side="left")
         amt_var = tk.IntVar(value=0)
-        sp_a = ttk.Spinbox(r, from_=0, to=16777215, width=9, textvariable=amt_var)
-        sp_a.pack(side="left", padx=1)
+        sp_a = None
+        if is_equip:
+            # Save-side rows only: horse=HP, shield=durability, food=count; templates have no such field
+            ttk.Label(r, text="Dur/Count").pack(side="left")
+            sp_a = ttk.Spinbox(r, from_=0, to=16777215, width=9, textvariable=amt_var)
+            sp_a.pack(side="left", padx=1)
         btn = ttk.Button(r, text="Clear", command=lambda k=k, eq=is_equip: self._clear_slot(k, eq))
         btn.pack(side="left", padx=2)
 
@@ -1191,19 +1586,24 @@ class ViewerV2:
         def on_amt(*a):
             self._apply_slot(k, is_equip)
         cmb.bind("<<ComboboxSelected>>", on_item)
+        sp_t.bind("<<ComboboxSelected>>", on_type)
         sp_t.bind("<FocusOut>", on_type); sp_t.bind("<Return>", on_type)
-        sp_a.bind("<FocusOut>", on_amt); sp_a.bind("<Return>", on_amt)
+        if sp_a is not None:
+            sp_a.bind("<FocusOut>", on_amt); sp_a.bind("<Return>", on_amt)
         return dict(cmb=cmb, type_var=type_var, amt_var=amt_var, sp_t=sp_t, sp_a=sp_a, btn=btn)
 
-    def _set_row(self, w, pair):
+    def _set_row(self, w, pair, is_equip):
         iid, mod = pair
         if iid == -1:
             w["cmb"].current(0)
         else:
             idx = (iid + 1) if 0 <= iid < len(self.item_options) - 1 else 0
             w["cmb"].current(idx)
-        t, a = M.SaveDoc.decode_mod(mod)
-        w["type_var"].set(t)
+        if is_equip:
+            t, a = M.SaveDoc.decode_mod(mod)   # save: (modifier, durability/count)
+        else:
+            t, a = mod, 0                      # template: 2nd value = bare modifier
+        w["type_var"].set(self._imod_text(t))
         w["amt_var"].set(a)
 
     def _tpl_inv(self, i, n):
@@ -1229,18 +1629,23 @@ class ViewerV2:
         for w in self.inv_rows + self.equip_rows:
             w["cmb"].config(state="normal")
         for k, w in enumerate(self.inv_rows):
-            self._set_row(w, inv[k])
+            self._set_row(w, inv[k], False)
         for k, w in enumerate(self.equip_rows):
-            self._set_row(w, eq[k])
+            self._set_row(w, eq[k], True)
         # 背包始终可编辑; 装备按条件
         for w in self.inv_rows:
             w["cmb"].config(state="readonly")
-            w["sp_t"].config(state="normal"); w["sp_a"].config(state="normal"); w["btn"].config(state="normal")
+            w["sp_t"].config(state="normal")
+            if w["sp_a"] is not None:
+                w["sp_a"].config(state="normal")
+            w["btn"].config(state="normal")
         cstate = "readonly" if eq_editable else "disabled"
         sstate = "normal" if eq_editable else "disabled"
         for w in self.equip_rows:
             w["cmb"].config(state=cstate); w["sp_t"].config(state=sstate)
-            w["sp_a"].config(state=sstate); w["btn"].config(state=sstate)
+            if w["sp_a"] is not None:
+                w["sp_a"].config(state=sstate)
+            w["btn"].config(state=sstate)
         self._update_inv_summary(i)
 
     def _update_inv_summary(self, i):
@@ -1257,17 +1662,16 @@ class ViewerV2:
         self.inv_summary.config(text=f"{tpl}   |   {eq}")
 
     def _collect_inv_flat(self):
-        """从 64 个背包行收集扁平 int 列表 (Itemsid/修饰符 成对)。"""
+        """Collect flat int pairs (item id / modifier) from the 64 bag rows.
+        Template 2nd value = bare modifier enum (no durability/count) —
+        the old code wrote (count<<8|type) here, which corrupted troops.txt."""
         flat=[]
         for w in self.inv_rows:
             sel=w["cmb"].current()
             iid=-1 if (sel is None or sel<=0) else sel-1
             iid=max(-1, min(self.mod.nitems, iid))
-            try: t=max(0,min(255,int(w["type_var"].get() or 0)))
-            except Exception: t=0
-            try: a=max(0,min(16777215,int(w["amt_var"].get() or 0)))
-            except Exception: a=0
-            flat.append(iid); flat.append(M.SaveDoc.encode_mod(a, t))
+            flat.append(iid)
+            flat.append(self._parse_imod(w["type_var"].get()))
         return flat
 
     def _apply_slot(self, k, is_equip, item_sel=None):
@@ -1279,22 +1683,19 @@ class ViewerV2:
         # 合法性校验: Items id 必须在 [-1, nitems]
         item_id = -1 if (sel is None or sel <= 0) else sel - 1
         item_id = max(-1, min(self.mod.nitems, item_id))
-        try:
-            t = max(0, min(255, int(w["type_var"].get())))
-        except Exception:
-            t = 0
+        t = self._parse_imod(w["type_var"].get())
         try:
             a = max(0, min(16777215, int(w["amt_var"].get())))
         except Exception:
             a = 0
-        mod = M.SaveDoc.encode_mod(a, t)
+        mod = M.SaveDoc.encode_mod(a, t)   # save: (modifier<<24) | durability/count
         if is_equip:
             if not (self.doc is not None and self.doc.is_reliable(i)):
                 return
             try:
                 self.doc.set_equipment_slot(i, k, item_id, mod)
                 self._update_inv_summary(i)
-                self.set_status(f"Wrote #{i} equip slot {k}: item={item_id} type={t} count={a} (save instance)")
+                self.set_status(f"Wrote #{i} equip slot {k}: item={item_id} modifier={self._imod_text(t)} dur/count={a} (save instance)")
             except Exception as ex:
                 self.set_status(f"Write failed: {ex}", err=True)
         else:
@@ -1303,7 +1704,7 @@ class ViewerV2:
                 flat = self._collect_inv_flat()
                 self.mod.set_troop_inventory(i, flat)
                 self._update_inv_summary(i)
-                self.set_status(f"Wrote #{i} backpack slot {k}: item={item_id} type={t} count={a} (troops.txt template · unsaved)")
+                self.set_status(f"Wrote #{i} backpack slot {k}: item={item_id} modifier={self._imod_text(t)} (troops.txt template · unsaved)")
             except Exception as ex:
                 self.set_status(f"Write failed: {ex}", err=True)
 
@@ -1313,7 +1714,7 @@ class ViewerV2:
             self.set_status("Please select a troop first.", err=True)
             return
         w = (self.equip_rows if is_equip else self.inv_rows)[k]
-        w["cmb"].current(0); w["type_var"].set(0); w["amt_var"].set(0)
+        w["cmb"].current(0); w["type_var"].set(self._imod_text(0)); w["amt_var"].set(0)
         if is_equip:
             if not (self.doc is not None and self.doc.is_reliable(i)):
                 self.set_status("Equip slots can only be cleared when a save is loaded and the troop is reliable.", err=True)
@@ -1326,6 +1727,10 @@ class ViewerV2:
         try:
             out = self.mod.save_module(backup=True)
             self.set_status(f"Module saved with backup: {os.path.basename(str(out))}", ok=True)
+            try:
+                self.flag_hint.config(text="Template · saved")
+            except Exception:
+                pass
             self._update_inv_summary(self.cur)
         except Exception as ex:
             messagebox.showerror("Save failed", str(ex))

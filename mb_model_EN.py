@@ -201,6 +201,17 @@ for _n in dir(_cn):
 # mb_model.TF_NAMES / decode_tf 的标签是中文(勾选框与 Decoded 行会显示中文),
 # 英文 GUI 需要英文标签。位值必须与中文版完全一致(同一 header_troops.py 定义),
 # 只是标签翻译; 因此必须放在上面的透出循环之后, 确保最终生效的是这份英文表。
+
+# English item-modifier names (same enum 0..42 as mb_model.IMOD_NAMES;
+# source: module-system header_item_modifiers.py). Labels only — values/length identical.
+IMOD_NAMES = [
+    "Plain", "Cracked", "Rusty", "Bent", "Chipped", "Battered", "Poor", "Crude", "Old", "Cheap",
+    "Fine", "Well-made", "Sharp", "Balanced", "Tempered", "Deadly", "Exquisite", "Masterwork",
+    "Heavy", "Strong", "Powerful", "Tattered", "Ragged", "Rough", "Sturdy", "Thick", "Hardened",
+    "Reinforced", "Superb", "Lordly", "Lame", "Swaybacked", "Stubborn", "Timid", "Meek",
+    "Spirited", "Champion", "Fresh", "Day-old", "Two days old", "Smelling", "Rotten", "Large bag",
+]
+
 TF_NAMES = [
     (_cn.TF_FEMALE, "Female (tf_female)"),
     (_cn.TF_UNDEAD, "Undead (tf_undead)"),
