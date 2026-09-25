@@ -113,32 +113,77 @@ def parse_party_templates(text):
                 break
             stacks.append(quad)                   # 每个栈存为 [troop, a, b, flag]
             i += 4
-        trailing = [int(x) for x in body[i:]]     # 哨兵及之后的 -1 填充(原样保留)
+        trailing = [int(x) for x in body[i:]]     # 空槽的 -1 (每个占 1 token)
         trailing_ws = s[len(s.rstrip()):]         # 行末空白(尾部空格; CRLF 已在 line_sep 还原)
+        # ★ 栈位容量 = 已用槽 + 空槽。真实格式是「固定 6 个栈槽」:
+        #   有兵种的槽写 4 token(troop a b flag), 空槽只写 1 个 -1。
+        #   => 铁律 栈数 + 尾部 -1 数 = 容量(恒为 6)。增删栈必须按容量重算尾部,
+        #      否则整行 token 数偏移, 游戏按 token 流读取时会把下一行读串
+        #      (表现为 unexpected end-of-file / 驻军出现主角、Temp Troop 等错乱兵种)。
+        nslots = len(stacks) + len(trailing)
         out.append({"id": tid, "name": name, "flags": flags,
                     "fixed0": fixed0, "h4": h4, "h5": h5,
                     "stacks": stacks, "trailing": trailing,
-                    "trailing_ws": trailing_ws})
+                    "nslots": nslots, "trailing_ws": trailing_ws})
     return out
 
 
 def serialize_party_templates(templates, header="partytemplatesfile version 1",
                               line_sep="\n"):
-    """把模板列表序列化为可写回的文本。格式保持: 6 个头部 token + 栈区 + 原样 trailing + 行末空白。
+    """把模板列表序列化为可写回的文本: 6 个头部 token + 栈区 + 补足到容量的空槽 -1 + 行末空白。
+
+    ⚠ 关键(2026-09-24 修复): 尾部 -1 不是"填充", 而是**未使用的栈槽**, 每个占 1 token。
+    真实格式是「固定 6 个栈槽」: 有兵种的槽写 4 token, 空槽写 1 个 -1。
+    因此增删栈后必须按容量**重算**尾部 (空槽数 = 容量 - 栈数), 不能原样保留 ——
+    否则整行 token 数偏移, 游戏按 token 流读取时把下一行字段读串
+    (实测: 加一个栈 → 槽数 6→7; 后果是 unexpected end-of-file / 驻军出现错乱兵种)。
     line_sep 用于还原原文件换行(CRLF/LF), 使未改动的行做到字节级一致。
     ⚠ 须原样写回 h4/h5(第5/6 token), 否则丢失 2 头部字段、破坏存档。"""
     lines = [header, str(len(templates))]
     for t in templates:
         parts = [t["id"], t["name"], str(int(t["flags"])), str(int(t["fixed0"])),
                  str(int(t.get("h4", 0))), str(int(t.get("h5", 0)))]
-        for s in t["stacks"]:
+        stacks = t["stacks"]
+        for s in stacks:
             parts += [str(int(x)) for x in s]
-        trailing = list(t.get("trailing", []))
-        if not t["stacks"] and not trailing:    # 空模板兜底: 至少保留哨兵 -1
+        # 容量: 优先用解析时记录的 nslots; 缺省按原始 trailing 推算; 再兜底 6
+        nslots = int(t.get("nslots") or (len(stacks) + len(t.get("trailing", []))) or 6)
+        if len(stacks) > nslots:                  # 超出容量: 截断并交由上层提示
+            stacks = stacks[:nslots]
+            parts = parts[:6 + 4 * nslots]
+        trailing = [-1] * (nslots - len(stacks))   # ★ 按容量重算, 而非原样保留
+        if not stacks and not trailing:            # 兜底: 至少保留一个空槽
             trailing = [-1]
         parts += [str(int(x)) for x in trailing]
         lines.append(" ".join(parts) + t.get("trailing_ws", ""))
     return line_sep.join(lines) + line_sep
+
+
+def decode_module_text(raw):
+    """安全解码模组文本文件, 返回 (text, encoding, bom)。
+
+    ⚠ 绝不使用 decode("utf-8", errors="replace"): 它把无法按 UTF-8 解析的字节
+      静默替换成 U+FFFD, 一旦写回就把原字符永久损坏(GBK/GB18030 编码的中文模组尤甚)。
+    判定顺序: UTF-8(剥离 BOM 后再解) -> gb18030 -> latin-1。
+      latin-1 恒成功且字节可逆, 保证任何文件都能"原样读回 / 原样写回"。"""
+    bom = b"\xef\xbb\xbf" if raw[:3] == b"\xef\xbb\xbf" else b""
+    body = raw[len(bom):]
+    for enc in ("utf-8", "gb18030", "latin-1"):
+        try:
+            return body.decode(enc), enc, bom
+        except UnicodeDecodeError:
+            continue
+    return body.decode("latin-1"), "latin-1", bom
+
+
+def encode_module_text(text, encoding, bom=b""):
+    """decode_module_text 的逆操作, 返回可直接 write_bytes 的原始字节。
+
+    ⚠ 必须走 write_bytes, 不能走 write_text —— 后者在 Windows 上属文本模式,
+      会把每个 '\\n' 翻译成 '\\r\\n'; 原本已是 CRLF 的文本会被二次翻倍成
+      '\\r\\r\\n'(每处换行多 1 个 CR), 引擎解析时报 unexpected end-of-file。
+      2026-09-24 修复: party_templates.txt 曾被此问题写坏。"""
+    return (bom or b"") + text.encode(encoding)
 
 
 # ---------------- 物品完整解析(自包含, 恢复 v1 的"物品属性查看/修改"功能) ----------------
@@ -374,9 +419,32 @@ class ScrolledFrame(ttk.Frame):
             scrollregion=self.canvas.bbox("all")))
 
 
+def safe_int(var, default=None):
+    """安全读取 tk 数值变量 (IntVar / StringVar), 空值或非法值返回 default, 绝不抛异常。
+
+    背景: ttk.Spinbox 在用户「清空输入框准备重填」的瞬间会把 textvariable 置为 ""，
+    此时 IntVar.get() 会抛 _tkinter.TclError: expected integer but got ""。
+    这里统一吸收: 空/非法 → default（调用方据此跳过本次写入, 而不是写成 0）。
+    """
+    try:
+        v = var.get()
+    except Exception:
+        return default          # TclError / 变量已失效
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 class ViewerV2:
     def __init__(self, root):
         self.root = root
+        # 兜底: 未捕获的 Tk 回调异常只报一行, 不再往控制台刷整页 traceback
+        self.root.report_callback_exception = self._on_tk_error
         self.root.title("骑马与砍杀 1.011 兵种/物品查看器 v2 (含技能位置对照)")
         self.root.geometry("1360x960")
 
@@ -401,6 +469,10 @@ class ViewerV2:
         self.pt_file = None         # party_templates.txt 路径
         self.pt_header = "partytemplatesfile version 1"  # 第1行(原样保留)
         self.pt_line_sep = "\n"      # 原文件换行符(CRLF/LF), 载入时校正
+        self.pt_encoding = "utf-8"   # 原文件编码(载入时判定, 写回必须用同一编码)
+        self.pt_bom = b""            # 原文件 UTF-8 BOM(写回时原样补回)
+        self.pt_raw = b""            # 载入时的原始字节(用于往返自检)
+        self.pt_roundtrip_ok = True  # 解析->序列化能否字节级还原(不能则禁止保存)
         self.party_templates = []   # 解析后的模板列表(含编辑)
         self.pt_original = []       # 载入时的原始副本(用于差异/修改记录)
         self.pt_cur = None          # 当前选中的模板索引
@@ -506,6 +578,20 @@ class ViewerV2:
         self.fac_defect_btn.pack(side="left", padx=2)
         self.fac_hint = ttk.Label(facbar, text="载入存档后可改", foreground="#888")
         self.fac_hint.pack(side="left", padx=6)
+        # 升级路径编辑: 修改 troops.txt 头行 upgrade1/upgrade2 (影响新开局)
+        ulf = ttk.LabelFrame(gf, text="升级路径 (可编辑, 点『保存模块』写盘生效)")
+        ulf.pack(side="top", fill="x", padx=4, pady=2)
+        ulrow = ttk.Frame(ulf)
+        ulrow.pack(side="top", fill="x", padx=6, pady=3)
+        ttk.Label(ulrow, text="升级1:").pack(side="left")
+        self.up1_combo = ttk.Combobox(ulrow, width=28, state="readonly")
+        self.up1_combo.pack(side="left", padx=3)
+        ttk.Label(ulrow, text="升级2:").pack(side="left")
+        self.up2_combo = ttk.Combobox(ulrow, width=28, state="readonly")
+        self.up2_combo.pack(side="left", padx=3)
+        ttk.Button(ulrow, text="应用升级", command=self.apply_troop_upgrades).pack(side="left", padx=8)
+        self.up_hint = ttk.Label(ulf, text="模板·未保存", foreground="#888")
+        self.up_hint.pack(side="top", fill="x", padx=6, pady=(0, 3))
         # 标志位(tf_*)勾选编辑面板: 修改 troops.txt 抽象兵种头行的 flags (影响新开局)
         # 程序在「勾选项 ↔ 数值」之间自动转换, 用户无需理解每一位代表什么。
         flf = ttk.LabelFrame(gf, text="标志位 (勾选即写入模板, 点『保存模块』写盘)")
@@ -871,6 +957,20 @@ class ViewerV2:
         else:
             self.status.config(foreground="#000000")
 
+    def _on_tk_error(self, exc, val, tb):
+        """Tk 回调异常兜底: 状态栏一行 + stderr 一行, 不打印整页 traceback。
+
+        最常见触发是 Spinbox 被清空瞬间 IntVar.get() 抛 TclError；
+        写入路径已用 safe_int() 吸收, 这里只作最后一道闸防止控制台刷屏。
+        """
+        try:
+            name = getattr(exc, "__name__", str(exc))
+            msg = "%s: %s" % (name, val)
+            self.set_status("⚠ 界面回调出错(已忽略): %s" % msg, err=True)
+            sys.stderr.write("[MB1011] Tk callback error: %s\n" % msg)
+        except Exception:
+            pass
+
     # ---------------- 选中 ----------------
     def on_troop_select(self, ev=None):
         s = self.tlist.curselection()
@@ -952,6 +1052,45 @@ class ViewerV2:
         v = self._commit_troop_flags()
         if v is not None:
             self.show_troop(self.cur)
+
+    # ---- 升级路径(头行 upgrade1/upgrade2) 编辑 ----
+    def _sync_upgrade_combos(self, i):
+        """把升级下拉框同步到该兵种模板当前的 upgrade1/upgrade2。"""
+        if getattr(self, "up1_combo", None) is None:
+            return
+        t = self.mod.troops[i]
+        opts = ["无升级(0)"] + [f"{k}: {self.tr_name(k)}" for k in range(len(self.mod.troops))]
+        self.up1_combo["values"] = opts
+        self.up2_combo["values"] = opts
+        def _opt(u):
+            if not u or u < 0:
+                return opts[0]
+            if 0 <= u < len(self.mod.troops):
+                return f"{u}: {self.tr_name(u)}"
+            return opts[0]
+        self.up1_combo.set(_opt(t.get("upgrade1", -1)))
+        self.up2_combo.set(_opt(t.get("upgrade2", -1)))
+
+    def apply_troop_upgrades(self):
+        """改写模板头行 upgrade1/upgrade2 (troops.txt, 影响新开局)。"""
+        if self.cur is None:
+            self.set_status("请先选择兵种。", err=True)
+            return
+        def _idx(combo):
+            s = (combo.get() or "").strip()
+            if not s or s.startswith("无升级"):
+                return 0
+            return int(s.split(":", 1)[0])
+        try:
+            u1 = _idx(self.up1_combo)
+            u2 = _idx(self.up2_combo)
+            self.mod.set_troop_upgrades(self.cur, u1, u2)
+        except Exception as ex:
+            self.set_status(f"写入失败: {ex}", err=True)
+            return
+        self.up_hint.config(text="模板·未保存")
+        self.set_status("升级路径已写入模板 (点『保存模块』写盘生效)", ok=True)
+        self.show_troop(self.cur)
 
     # ---- 属性 / 熟练 / 技能 编辑 (还原旧版查看器的逐项编辑能力) ----
     def apply_troop_attrs(self):
@@ -1164,6 +1303,9 @@ class ViewerV2:
 
         # 阵营下拉: 载入存档且兵种可靠时可改(即领主跳槽)
         self._sync_faction_combo(i)
+
+        # 升级路径下拉: 同步到模板头行的 upgrade1/upgrade2
+        self._sync_upgrade_combos(i)
 
         # 物品: 可编辑网格 (无存档时显示模板值, 载入存档且兵种可靠时可编辑)
         self._fill_inv_editor(i)
@@ -1726,6 +1868,7 @@ class ViewerV2:
             self.set_status(f"已保存模块并备份: {os.path.basename(str(out))}", ok=True)
             try:
                 self.flag_hint.config(text="模板·已保存")
+                self.up_hint.config(text="模板·已保存")
             except Exception:
                 pass
             self._update_inv_summary(self.cur)
@@ -1851,14 +1994,35 @@ class ViewerV2:
             self.set_status(f"未找到 party_templates.txt: {p} (该模块可能没有部队模板)", err=True)
             return
         raw = p.read_bytes()
+        self.pt_raw = raw
         self.pt_line_sep = "\r\n" if b"\r\n" in raw else "\n"   # 还原原文件换行
-        text = raw.decode("utf-8", errors="replace")
+        # ⚠ 不能用 decode("utf-8", errors="replace"): 无法解析的字节会被换成 U+FFFD,
+        #    再写回就把原字符永久损坏。改为严格判定 + 记住编码, 写回时用同一编码。
+        text, self.pt_encoding, self.pt_bom = decode_module_text(raw)
         self.pt_header = text.split("\n", 1)[0].rstrip("\r") or "partytemplatesfile version 1"
         self.party_templates = parse_party_templates(text)
         self.pt_original = copy.deepcopy(self.party_templates)
+        self.pt_roundtrip_ok = self._pt_roundtrip_ok()
         if getattr(self, "ptlist", None) is not None:
             self.refresh_pt()
-        self.set_status(f"已载入部队模板: {p.name}  ({len(self.party_templates)} 个模板)")
+        n = len(self.party_templates)
+        if self.pt_roundtrip_ok:
+            self.set_status(f"已载入部队模板: {p.name}  ({n} 个模板, 自检通过)", ok=True)
+        else:
+            self.set_status(f"已载入部队模板: {p.name}  ({n} 个模板) "
+                            f"⚠ 自检失败: 无法字节级还原该文件, 已禁止保存以免写坏模组", err=True)
+
+    def _pt_roundtrip_ok(self):
+        """自检: 把载入的原始模板序列化后能否还原为原始文件字节。
+
+        这是落盘前的保险丝 —— 一旦本工具的解析器跟不上某个模组的实际格式,
+        就拒绝写盘, 而不是把人家的模组写成坏档。"""
+        try:
+            out = serialize_party_templates(self.pt_original, self.pt_header,
+                                            self.pt_line_sep)
+            return encode_module_text(out, self.pt_encoding, self.pt_bom) == self.pt_raw
+        except Exception:
+            return False
 
     def build_pt_tab(self):
         top = ttk.Frame(self.tab_pt)
@@ -1984,11 +2148,17 @@ class ViewerV2:
         def on_troop(ev=None):
             self._apply_pt_stack(k, 0, cmb.current())
         def on_a(*a):
-            self._apply_pt_stack(k, 1, a_var.get())
+            v = safe_int(a_var)
+            if v is None: return      # 输入框被清空(正在重填), 忽略本次
+            self._apply_pt_stack(k, 1, v)
         def on_b(*a):
-            self._apply_pt_stack(k, 2, b_var.get())
+            v = safe_int(b_var)
+            if v is None: return
+            self._apply_pt_stack(k, 2, v)
         def on_f(*a):
-            self._apply_pt_stack(k, 3, f_var.get())
+            v = safe_int(f_var)
+            if v is None: return
+            self._apply_pt_stack(k, 3, v)
         cmb.bind("<<ComboboxSelected>>", on_troop)
         sp_a.bind("<FocusOut>", on_a); sp_a.bind("<Return>", on_a)
         sp_b.bind("<FocusOut>", on_b); sp_b.bind("<Return>", on_b)
@@ -2015,9 +2185,21 @@ class ViewerV2:
         if i is None:
             self.set_status("请先在左侧选择一个部队模板。", err=True)
             return
-        self.party_templates[i]["stacks"].append([-1, 0, 0, 0])
-        self._fill_pt_stacks(self.party_templates[i])
-        self.pt_stack_count.config(text=f"兵种栈: {len(self.party_templates[i]['stacks'])}")
+        t = self.party_templates[i]
+        nslots = int(t.get("nslots") or 6)      # 该模板的栈位容量(真实格式恒为 6)
+        if len(t["stacks"]) >= nslots:
+            self.set_status(f"无法新增: 该模板只有 {nslots} 个栈位且已用完 "
+                            f"(party_templates 每行的栈槽是固定 {nslots} 个, "
+                            f"超出会让整行 token 数偏移、游戏读串后续模板)。"
+                            f"请先删除或改写现有栈。", err=True)
+            return
+        # -1 是"空槽/结束"哨兵: 一行里空槽只占 1 个 token, 而写成一条栈要占 4 个 token,
+        # 所以占位只能临时用 -1, 保存前必须选好兵种(见 save_party_templates 守卫1)。
+        t["stacks"].append([-1, 0, 0, 0])
+        self._fill_pt_stacks(t)
+        self.pt_stack_count.config(text=f"兵种栈: {len(t['stacks'])} / {nslots}")
+        self.set_status("已新增一个空兵种栈: 请先在它的下拉框里选好兵种再保存 "
+                        "(-1 是栈区结束哨兵, 未指定兵种会被拒绝保存)。", ok=True)
 
     def _del_pt_stack(self, k):
         i = self.pt_cur
@@ -2064,6 +2246,25 @@ class ViewerV2:
         if self.pt_file is None or not self.party_templates:
             messagebox.showinfo("提示", "请先载入含 party_templates.txt 的模块。")
             return
+        # 守卫1: 不允许写入"兵种未指定(-1)"的栈。 -1 是栈区终止哨兵, 写进去会被引擎
+        #        当成"栈到此为止", 该栈及其后的内容都不会生效(=静默失效的修改)。
+        for _t in self.party_templates:
+            for _k, _s in enumerate(_t["stacks"]):
+                if int(_s[0]) < 0:
+                    messagebox.showerror(
+                        "无法保存",
+                        f"模板 {_t.get('id', '?')} 的第 {_k + 1} 个兵种栈没有指定兵种(-1)。\n\n"
+                        f"-1 是兵种栈区的结束哨兵, 写进文本游戏会把它当作“栈到此为止”。\n"
+                        f"请为每个新增的栈先在下拉框里选好兵种, 然后再保存。")
+                    return
+        # 守卫2: 往返自检。若本工具无法字节级还原原文件, 宁可不写也不能写坏模组。
+        if not getattr(self, "pt_roundtrip_ok", True) and not self._pt_roundtrip_ok():
+            messagebox.showerror(
+                "无法保存",
+                "自检失败: 本工具无法字节级还原该 party_templates.txt。\n\n"
+                "为避免写坏模组已阻止写入。请把该文件反馈给作者 —— "
+                "它的编码或版式可能超出了当前解析器的支持范围。")
+            return
         records = []
         for cur, orig in zip(self.party_templates, self.pt_original):
             tid = cur["id"]
@@ -2085,7 +2286,13 @@ class ViewerV2:
                 shutil.copy2(str(self.pt_file), str(self.pt_file) + ".bak")
             out = serialize_party_templates(self.party_templates, self.pt_header,
                                            self.pt_line_sep)
-            self.pt_file.write_text(out, encoding="utf-8")
+            # ⚠ 必须 write_bytes: write_text 是文本模式, 在 Windows 上会把每个 '\n'
+            #    翻译成 '\r\n'; 原文件是 CRLF 时就被二次翻倍成 '\r\r\n'(每条换行多 1 个 CR),
+            #    引擎解析会因行尾异常而报 unexpected end-of-file。2026-09-24 修复。
+            data = encode_module_text(out, self.pt_encoding, self.pt_bom)
+            self.pt_file.write_bytes(data)
+            self.pt_raw = data          # 重新基线: 后续自检以本次写出的新文件为准
+            self.pt_roundtrip_ok = True
             self.pt_original = copy.deepcopy(self.party_templates)
             self._log_pt_change(records)
             self.set_status(f"已保存部队模板并备份: {self.pt_file.name}  ({len(records)} 处修改)", ok=True)

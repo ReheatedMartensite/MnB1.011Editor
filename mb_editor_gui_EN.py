@@ -67,12 +67,37 @@ class ScrolledFrame(ttk.Frame):
             scrollregion=self.canvas.bbox("all")))
 
 
+def safe_int(var, default=None):
+    """Safely read a Tk numeric variable (IntVar / StringVar).
+
+    Background: clearing a ttk.Spinbox sets its textvariable to "" for a moment,
+    and IntVar.get() then raises _tkinter.TclError: expected integer but got "".
+    Because the value is traced with trace_add("write"), that throws a full
+    page of traceback into the console. Empty/invalid -> default (callers skip
+    the write instead of pushing a 0 into the save).
+    """
+    try:
+        v = var.get()
+    except Exception:
+        return default          # TclError / variable gone
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 # ----------------------------------------------------------------------------
 # 主Apply
 # ----------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self, module_arg=None):
         super().__init__()
+        # Fallback: uncaught Tk callback errors report one line, not a full traceback
+        self.report_callback_exception = self._on_tk_error
         self.title("Mount & Blade 1.011 Save Editor v3.4 (WD - Minuet)")
         self.geometry("1200x780")
         self._forced_module = module_arg      # --module arg / env var
@@ -981,25 +1006,35 @@ class App(tk.Tk):
 
     def on_attr(self, i):
         if not self._can_edit(): return
-        vals = [v.get() for v in self.attr_vars]
+        vals = [safe_int(v) for v in self.attr_vars]
+        if any(v is None for v in vals):
+            return      # a box is empty (being retyped): skip, don't write zeros
         self.doc.set_attrs(self.cur_idx, vals)
 
     def on_prof(self, i):
         if not self._can_edit(): return
-        vals = [v.get() for v in self.prof_vars]
+        vals = [safe_int(v) for v in self.prof_vars]
+        if any(v is None for v in vals):
+            return
         self.doc.set_profs(self.cur_idx, vals)
 
     def on_level(self):
         if not self._can_edit(): return
-        self.doc.set_level(self.cur_idx, self.level_var.get())
+        v = safe_int(self.level_var)
+        if v is None: return
+        self.doc.set_level(self.cur_idx, v)
 
     def on_xp(self):
         if not self._can_edit(): return
-        self.doc.set_xp(self.cur_idx, self.xp_var.get())
+        v = safe_int(self.xp_var)
+        if v is None: return
+        self.doc.set_xp(self.cur_idx, v)
 
     def on_pts(self):
         if not self._can_edit(): return
-        self.doc.set_pts(self.cur_idx, self.pts_var.get())
+        v = safe_int(self.pts_var)
+        if v is None: return
+        self.doc.set_pts(self.cur_idx, v)
 
     # ---------------- 兵种 技能页 ----------------
     def _build_skill_labels(self):
@@ -1028,7 +1063,10 @@ class App(tk.Tk):
 
     def on_skill(self, k):
         if not self._can_edit(): return
-        self.skill_vals[k] = self._skill_vars[k].get()
+        v = safe_int(self._skill_vars[k])
+        if v is None:
+            return      # box cleared (being retyped): skip, don't write
+        self.skill_vals[k] = v
         self.doc.set_skills(self.cur_idx, self.skill_vals)
 
     # ---------------- 兵种 物品栏 / 装备 ----------------
@@ -1064,7 +1102,10 @@ class App(tk.Tk):
             self.apply_slot(k, is_equip, modifier=m)
         def on_type_amt(*a):
             # save dword = (modifier << 24) | durability/count
-            m = ((ttype.get() & 0xFF) << 24) | (tamount.get() & 0xFFFFFF)
+            t = safe_int(ttype); am = safe_int(tamount)
+            if t is None or am is None:
+                return      # box cleared (being retyped): skip
+            m = ((t & 0xFF) << 24) | (am & 0xFFFFFF)
             mod_var.set(str(m))
             self.apply_slot(k, is_equip, modifier=m)
         cmb.bind("<<ComboboxSelected>>", on_item)
@@ -1380,6 +1421,22 @@ class App(tk.Tk):
             self.status.config(foreground="red")
         else:
             self.status.config(foreground="black")
+
+    def _on_tk_error(self, exc, val, tb):
+        """Fallback for uncaught Tk callback errors: one status line + one stderr
+        line, instead of dumping a full traceback into the console.
+
+        Most common trigger: clearing a Spinbox sets the textvariable to "" and
+        IntVar.get() raises TclError. Real write paths are protected by
+        safe_int(); this is only the last-resort gate against console floods.
+        """
+        try:
+            name = getattr(exc, "__name__", str(exc))
+            msg = "%s: %s" % (name, val)
+            self._set_status("! Tk callback error (ignored): %s" % msg, warn=True)
+            sys.stderr.write("[MB1011] Tk callback error: %s\n" % msg)
+        except Exception:
+            pass
 
 
 def _parse_module_arg(argv):

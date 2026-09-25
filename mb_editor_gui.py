@@ -66,12 +66,36 @@ class ScrolledFrame(ttk.Frame):
             scrollregion=self.canvas.bbox("all")))
 
 
+def safe_int(var, default=None):
+    """安全读取 tk 数值变量 (IntVar / StringVar), 空值或非法值返回 default, 绝不抛异常。
+
+    背景: ttk.Spinbox 在用户「清空输入框准备重填」的瞬间会把 textvariable 置为 ""，
+    此时 IntVar.get() 会抛 _tkinter.TclError: expected integer but got ""，
+    而 trace_add("write") 回调随即炸出一整页 traceback（控制台刷屏）。
+    这里统一吸收: 空/非法 → default（调用方据此跳过本次写入, 而不是写成 0）。
+    """
+    try:
+        v = var.get()
+    except Exception:
+        return default          # TclError / 变量已失效
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 # ----------------------------------------------------------------------------
 # 主应用
 # ----------------------------------------------------------------------------
 class App(tk.Tk):
     def __init__(self, module_arg=None):
         super().__init__()
+        # 兜底: 未捕获的 Tk 回调异常只报一行, 不再往控制台刷整页 traceback
+        self.report_callback_exception = self._on_tk_error
         self.title("骑砍 1.011 存档修改器 v3.4  (WD - Minuet 适配)")
         self.geometry("1200x780")
         self._forced_module = module_arg      # --module 指定 / 环境变量
@@ -980,25 +1004,35 @@ class App(tk.Tk):
 
     def on_attr(self, i):
         if not self._can_edit(): return
-        vals = [v.get() for v in self.attr_vars]
+        vals = [safe_int(v) for v in self.attr_vars]
+        if any(v is None for v in vals):
+            return      # 有输入框被清空(正在重填), 本次不写入, 避免把 0 灌进存档
         self.doc.set_attrs(self.cur_idx, vals)
 
     def on_prof(self, i):
         if not self._can_edit(): return
-        vals = [v.get() for v in self.prof_vars]
+        vals = [safe_int(v) for v in self.prof_vars]
+        if any(v is None for v in vals):
+            return
         self.doc.set_profs(self.cur_idx, vals)
 
     def on_level(self):
         if not self._can_edit(): return
-        self.doc.set_level(self.cur_idx, self.level_var.get())
+        v = safe_int(self.level_var)
+        if v is None: return
+        self.doc.set_level(self.cur_idx, v)
 
     def on_xp(self):
         if not self._can_edit(): return
-        self.doc.set_xp(self.cur_idx, self.xp_var.get())
+        v = safe_int(self.xp_var)
+        if v is None: return
+        self.doc.set_xp(self.cur_idx, v)
 
     def on_pts(self):
         if not self._can_edit(): return
-        self.doc.set_pts(self.cur_idx, self.pts_var.get())
+        v = safe_int(self.pts_var)
+        if v is None: return
+        self.doc.set_pts(self.cur_idx, v)
 
     # ---------------- 兵种 技能页 ----------------
     def _build_skill_labels(self):
@@ -1027,7 +1061,10 @@ class App(tk.Tk):
 
     def on_skill(self, k):
         if not self._can_edit(): return
-        self.skill_vals[k] = self._skill_vars[k].get()
+        v = safe_int(self._skill_vars[k])
+        if v is None:
+            return      # 技能框被清空(正在重填), 忽略本次, 不写存档
+        self.skill_vals[k] = v
         self.doc.set_skills(self.cur_idx, self.skill_vals)
 
     # ---------------- 兵种 物品栏 / 装备 ----------------
@@ -1063,7 +1100,10 @@ class App(tk.Tk):
             self.apply_slot(k, is_equip, modifier=m)
         def on_type_amt(*a):
             # 存档 u32 = (修饰符 << 24) | 耐久/数量
-            m = ((ttype.get() & 0xFF) << 24) | (tamount.get() & 0xFFFFFF)
+            t = safe_int(ttype); am = safe_int(tamount)
+            if t is None or am is None:
+                return      # 输入框被清空(正在重填), 忽略本次
+            m = ((t & 0xFF) << 24) | (am & 0xFFFFFF)
             mod_var.set(str(m))
             self.apply_slot(k, is_equip, modifier=m)
         cmb.bind("<<ComboboxSelected>>", on_item)
@@ -1379,6 +1419,20 @@ class App(tk.Tk):
             self.status.config(foreground="red")
         else:
             self.status.config(foreground="black")
+
+    def _on_tk_error(self, exc, val, tb):
+        """Tk 回调异常兜底: 状态栏一行提示 + stderr 一行, 不打印整页 traceback。
+
+        最常见的触发是 Spinbox 被清空瞬间 IntVar.get() 抛 TclError；
+        真正的写入路径已用 safe_int() 吸收，这里只作为最后一道闸，防止控制台刷屏。
+        """
+        try:
+            name = getattr(exc, "__name__", str(exc))
+            msg = "%s: %s" % (name, val)
+            self._set_status("⚠ 界面回调出错(已忽略): %s" % msg, warn=True)
+            sys.stderr.write("[MB1011] Tk callback error: %s\n" % msg)
+        except Exception:
+            pass
 
 
 def _parse_module_arg(argv):

@@ -515,6 +515,34 @@ class ModuleData:
         self.troops[idx]["flags"]=int(v) & 0xFFFFFFFF
         self._tpl_dirty=True
 
+    def set_troop_upgrades(self, idx, u1, u2):
+        """改写抽象兵种头行的 upgrade1/upgrade2 (第 8/9 个 token, 0 基索引 7/8)。
+        值为目标兵种在 troops.txt 中的 0 基序号; 0/-1 表示无升级目标。
+        仅替换目标兵种头行对应 token, 其余字节保留(含行尾/BOM)。"""
+        if not (0 <= idx < len(self.troops)): raise IndexError("troop idx")
+        ln = self._hdr_line_no[idx]
+        if ln is None: raise ValueError("该兵种无头行, 无法写回")
+        def _norm(u):
+            u = int(u)
+            return 0 if u < 0 else u          # 负数(含 -1)表示无升级 → 0
+        u1 = _norm(u1); u2 = _norm(u2)
+        n = len(self.troops)
+        for u, name in ((u1, "升级1"), (u2, "升级2")):
+            if not (0 <= u < n):
+                raise ValueError(f"{name} 目标 {u} 越界 (合法范围 0..{n-1}, 0=无升级)")
+        toks = self._raw_lines[ln].split()
+        while len(toks) < 9:
+            toks.append("0")
+        toks[7] = str(u1)
+        toks[8] = str(u2)
+        ending = ""
+        m = re.search(r"(\r?\n)$", self._raw_lines[ln])
+        if m: ending = m.group(1)
+        self._raw_lines[ln] = " ".join(toks) + ending
+        self.troops[idx]["upgrade1"] = u1
+        self.troops[idx]["upgrade2"] = u2
+        self._tpl_dirty = True
+
     def _write_troop_int_line(self, idx, ln, values):
         """把整数列表写回 troops.txt 中该兵种的某一行 (仅替换该行, 保留行尾/BOM)。"""
         if ln is None: raise ValueError("该兵种缺少对应行, 无法写回")

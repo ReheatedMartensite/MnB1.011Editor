@@ -114,32 +114,82 @@ def parse_party_templates(text):
                 break
             stacks.append(quad)                   # 每个栈存为 [troop, a, b, flag]
             i += 4
-        trailing = [int(x) for x in body[i:]]     # 哨兵及之后的 -1 填充(原样保留)
+        trailing = [int(x) for x in body[i:]]     # 空槽的 -1 (每个占 1 token)
         trailing_ws = s[len(s.rstrip()):]         # 行末空白(尾部空格; CRLF 已在 line_sep 还原)
+        # ★ Stack-slot capacity = used slots + empty slots. The real format has a
+        #   FIXED number of slots (6): a filled slot writes 4 tokens (troop a b flag),
+        #   an empty slot writes a single -1.  => invariant: stacks + trailing == 6.
+        #   Adding/removing a stack MUST recompute the trailing, otherwise the line
+        #   gets the wrong token count and the game (which reads a token stream)
+        #   mis-parses the next line: unexpected end-of-file, bogus garrison troops.
+        nslots = len(stacks) + len(trailing)
         out.append({"id": tid, "name": name, "flags": flags,
                     "fixed0": fixed0, "h4": h4, "h5": h5,
                     "stacks": stacks, "trailing": trailing,
-                    "trailing_ws": trailing_ws})
+                    "nslots": nslots, "trailing_ws": trailing_ws})
     return out
 
 
 def serialize_party_templates(templates, header="partytemplatesfile version 1",
                               line_sep="\n"):
-    """把模板列表序列化为可写回的文本。格式保持: 6 个头部 token + 栈区 + 原样 trailing + 行末空白。
-    line_sep 用于还原原File换行(CRLF/LF), 使未改动的行做到字节级一致。
-    ⚠ 须原样写回 h4/h5(第5/6 token), 否则丢失 2 头部字段、破坏存档。"""
+    """Serialize templates: 6 header tokens + stacks + empty-slot -1 padding + line-end space.
+
+    ! Key fix (2026-09-24): the trailing -1s are NOT filler, they are UNUSED SLOTS
+    (1 token each). The real format has a fixed number of slots (6): a filled slot
+    writes 4 tokens (troop a b flag), an empty slot writes a single -1.
+    So after adding/removing a stack the trailing MUST be recomputed
+    (empty = capacity - stacks); keeping it verbatim shifts the line's token count
+    and the game, which parses a token stream, then mis-reads the following line
+    (measured: adding one stack -> 7 slots; symptom: unexpected end-of-file,
+    garrisons filled with bogus troops such as Player / Temp Troop).
+    line_sep restores CRLF/LF so untouched lines stay byte-identical.
+    ! h4/h5 (tokens 5 and 6) must be written back verbatim or 2 header fields are lost.
+    """
     lines = [header, str(len(templates))]
     for t in templates:
         parts = [t["id"], t["name"], str(int(t["flags"])), str(int(t["fixed0"])),
                  str(int(t.get("h4", 0))), str(int(t.get("h5", 0)))]
-        for s in t["stacks"]:
+        stacks = t["stacks"]
+        for s in stacks:
             parts += [str(int(x)) for x in s]
-        trailing = list(t.get("trailing", []))
-        if not t["stacks"] and not trailing:    # 空模板兜底: 至少保留哨兵 -1
+        nslots = int(t.get("nslots") or (len(stacks) + len(t.get("trailing", []))) or 6)
+        if len(stacks) > nslots:                  # over capacity: truncate
+            stacks = stacks[:nslots]
+            parts = parts[:6 + 4 * nslots]
+        trailing = [-1] * (nslots - len(stacks))   # recompute, never keep verbatim
+        if not stacks and not trailing:
             trailing = [-1]
         parts += [str(int(x)) for x in trailing]
         lines.append(" ".join(parts) + t.get("trailing_ws", ""))
     return line_sep.join(lines) + line_sep
+
+
+def decode_module_text(raw):
+    """Safely decode a module text file. Returns (text, encoding, bom).
+
+    Never use decode("utf-8", errors="replace"): it silently turns bytes that are
+    not valid UTF-8 into U+FFFD, and writing that back permanently destroys the
+    original characters (fatal for GBK/GB18030-encoded Chinese modules).
+    Order: UTF-8 (after stripping BOM) -> gb18030 -> latin-1. latin-1 always
+    succeeds and is byte-reversible, so any file can be read/written back intact."""
+    bom = b"\xef\xbb\xbf" if raw[:3] == b"\xef\xbb\xbf" else b""
+    body = raw[len(bom):]
+    for enc in ("utf-8", "gb18030", "latin-1"):
+        try:
+            return body.decode(enc), enc, bom
+        except UnicodeDecodeError:
+            continue
+    return body.decode("latin-1"), "latin-1", bom
+
+
+def encode_module_text(text, encoding, bom=b""):
+    """Inverse of decode_module_text; returns raw bytes for write_bytes().
+
+    Must use write_bytes, never write_text: write_text is TEXT MODE, so on
+    Windows every '\\n' is translated to '\\r\\n'. A file that is already CRLF
+    therefore doubles into '\\r\\r\\n' (one extra CR per line break), which makes
+    the engine throw 'unexpected end-of-file'. Fixed 2026-09-24."""
+    return (bom or b"") + text.encode(encoding)
 
 
 # ---------------- Items完整解析(自包含, 恢复 v1 的"Items属性查看/修改"功能) ----------------
@@ -376,9 +426,32 @@ class ScrolledFrame(ttk.Frame):
             scrollregion=self.canvas.bbox("all")))
 
 
+def safe_int(var, default=None):
+    """Safely read a Tk numeric variable (IntVar / StringVar).
+
+    Clearing a ttk.Spinbox sets its textvariable to "" for a moment, and then
+    IntVar.get() raises _tkinter.TclError: expected integer but got "".
+    Empty/invalid -> default (callers skip the write instead of writing a 0).
+    """
+    try:
+        v = var.get()
+    except Exception:
+        return default          # TclError / variable gone
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
 class ViewerV2:
     def __init__(self, root):
         self.root = root
+        # Fallback: uncaught Tk callback errors report one line, not a full traceback
+        self.root.report_callback_exception = self._on_tk_error
         self.root.title("Mount & Blade 1.011 Troop/Item Viewer v2 (with skill position mapping)")
         self.root.geometry("1360x860")
 
@@ -403,6 +476,10 @@ class ViewerV2:
         self.pt_file = None         # party_templates.txt 路径
         self.pt_header = "partytemplatesfile version 1"  # 第1行(原样保留)
         self.pt_line_sep = "\n"      # 原File换行符(CRLF/LF), 载入时校正
+        self.pt_encoding = "utf-8"   # 原File编码(载入时判定, 写回必须用同一编码)
+        self.pt_bom = b""            # 原File UTF-8 BOM(写回时原样补回)
+        self.pt_raw = b""            # 载入时的原始字节(用于往返自检)
+        self.pt_roundtrip_ok = True  # 解析->序列化能否字节级还原(不能则禁止保存)
         self.party_templates = []   # 解析后的模板列表(含编辑)
         self.pt_original = []       # 载入时的原始副本(用于差异/修改记录)
         self.pt_cur = None          # 当前选中的模板索引
@@ -508,6 +585,20 @@ class ViewerV2:
         self.fac_defect_btn.pack(side="left", padx=2)
         self.fac_hint = ttk.Label(facbar, text="Editable after loading a save", foreground="#888")
         self.fac_hint.pack(side="left", padx=6)
+        # Upgrade-path editor: edits troops.txt header upgrade1/upgrade2 (affects new games)
+        ulf = ttk.LabelFrame(gf, text="Upgrade path (editable; click 'Save module' to write to disk)")
+        ulf.pack(side="top", fill="x", padx=4, pady=2)
+        ulrow = ttk.Frame(ulf)
+        ulrow.pack(side="top", fill="x", padx=6, pady=3)
+        ttk.Label(ulrow, text="Upgrade 1:").pack(side="left")
+        self.up1_combo = ttk.Combobox(ulrow, width=28, state="readonly")
+        self.up1_combo.pack(side="left", padx=3)
+        ttk.Label(ulrow, text="Upgrade 2:").pack(side="left")
+        self.up2_combo = ttk.Combobox(ulrow, width=28, state="readonly")
+        self.up2_combo.pack(side="left", padx=3)
+        ttk.Button(ulrow, text="Apply upgrades", command=self.apply_troop_upgrades).pack(side="left", padx=8)
+        self.up_hint = ttk.Label(ulf, text="Template · unsaved", foreground="#888")
+        self.up_hint.pack(side="top", fill="x", padx=6, pady=(0, 3))
         # Flag位(tf_*)勾选编辑面板: 修改 troops.txt 抽象Troops头行的 flags (影响新开局)
         # 程序在「勾选项 ↔ 数值」之间自动转换, 用户无需理解每一位代表什么。
         flf = ttk.LabelFrame(gf, text="Flags tf_* (checking writes to template; click 'Save module' to write to disk)")
@@ -873,6 +964,22 @@ class ViewerV2:
         else:
             self.status.config(foreground="#000000")
 
+    def _on_tk_error(self, exc, val, tb):
+        """Fallback for uncaught Tk callback errors: one status line + one stderr
+        line, instead of dumping a full traceback into the console.
+
+        Most common trigger: clearing a Spinbox sets the textvariable to "" and
+        IntVar.get() raises TclError. Write paths are protected by safe_int();
+        this is only the last-resort gate against console floods.
+        """
+        try:
+            name = getattr(exc, "__name__", str(exc))
+            msg = "%s: %s" % (name, val)
+            self.set_status("! Tk callback error (ignored): %s" % msg, err=True)
+            sys.stderr.write("[MB1011] Tk callback error: %s\n" % msg)
+        except Exception:
+            pass
+
     # ---------------- 选中 ----------------
     def on_troop_select(self, ev=None):
         s = self.tlist.curselection()
@@ -953,6 +1060,45 @@ class ViewerV2:
         v = self._commit_troop_flags()
         if v is not None:
             self.show_troop(self.cur)
+
+    # ---- Upgrade path (header upgrade1/upgrade2) editing ----
+    def _sync_upgrade_combos(self, i):
+        """Sync the upgrade dropdowns to the troop template's current upgrade1/upgrade2."""
+        if getattr(self, "up1_combo", None) is None:
+            return
+        t = self.mod.troops[i]
+        opts = ["No upgrade (0)"] + [f"{k}: {self.tr_name(k)}" for k in range(len(self.mod.troops))]
+        self.up1_combo["values"] = opts
+        self.up2_combo["values"] = opts
+        def _opt(u):
+            if not u or u < 0:
+                return opts[0]
+            if 0 <= u < len(self.mod.troops):
+                return f"{u}: {self.tr_name(u)}"
+            return opts[0]
+        self.up1_combo.set(_opt(t.get("upgrade1", -1)))
+        self.up2_combo.set(_opt(t.get("upgrade2", -1)))
+
+    def apply_troop_upgrades(self):
+        """Edit template header upgrade1/upgrade2 (troops.txt, affects new games)."""
+        if self.cur is None:
+            self.set_status("Please select a troop first.", err=True)
+            return
+        def _idx(combo):
+            s = (combo.get() or "").strip()
+            if not s or s.startswith("No upgrade"):
+                return 0
+            return int(s.split(":", 1)[0])
+        try:
+            u1 = _idx(self.up1_combo)
+            u2 = _idx(self.up2_combo)
+            self.mod.set_troop_upgrades(self.cur, u1, u2)
+        except Exception as ex:
+            self.set_status(f"Write failed: {ex}", err=True)
+            return
+        self.up_hint.config(text="Template · unsaved")
+        self.set_status("Upgrade path written to template (click 'Save module' to apply)", ok=True)
+        self.show_troop(self.cur)
 
     # ---- Attributes / Proficiencies / Skills editing (restore old viewer's per-field editing) ----
     def apply_troop_attrs(self):
@@ -1165,6 +1311,9 @@ class ViewerV2:
 
         # 阵营下拉: 载入存档且Troops可靠时可改(即领主跳槽)
         self._sync_faction_combo(i)
+
+        # Upgrade-path dropdowns: sync to template header upgrade1/upgrade2
+        self._sync_upgrade_combos(i)
 
         # Items: 可编辑网格 (无存档时显示模板值, 载入存档且Troops可靠时可编辑)
         self._fill_inv_editor(i)
@@ -1729,6 +1878,7 @@ class ViewerV2:
             self.set_status(f"Module saved with backup: {os.path.basename(str(out))}", ok=True)
             try:
                 self.flag_hint.config(text="Template · saved")
+                self.up_hint.config(text="Template · saved")
             except Exception:
                 pass
             self._update_inv_summary(self.cur)
@@ -1854,14 +2004,35 @@ class ViewerV2:
             self.set_status(f"party_templates.txt not found: {p} (this module may have no party templates)", err=True)
             return
         raw = p.read_bytes()
+        self.pt_raw = raw
         self.pt_line_sep = "\r\n" if b"\r\n" in raw else "\n"   # 还原原File换行
-        text = raw.decode("utf-8", errors="replace")
+        # Never decode("utf-8", errors="replace"): undecodable bytes become U+FFFD
+        # and writing them back permanently corrupts the original file. Detect the
+        # real encoding strictly, remember it, and write back with the same one.
+        text, self.pt_encoding, self.pt_bom = decode_module_text(raw)
         self.pt_header = text.split("\n", 1)[0].rstrip("\r") or "partytemplatesfile version 1"
         self.party_templates = parse_party_templates(text)
         self.pt_original = copy.deepcopy(self.party_templates)
+        self.pt_roundtrip_ok = self._pt_roundtrip_ok()
         if getattr(self, "ptlist", None) is not None:
             self.refresh_pt()
-        self.set_status(f"Loaded party templates: {p.name}  ({len(self.party_templates)} templates)")
+        n = len(self.party_templates)
+        if self.pt_roundtrip_ok:
+            self.set_status(f"Loaded party templates: {p.name}  ({n} templates, self-check passed)", ok=True)
+        else:
+            self.set_status(f"Loaded party templates: {p.name}  ({n} templates) "
+                            f"WARNING: cannot restore this file byte-for-byte; "
+                            f"saving is disabled to protect the module.", err=True)
+
+    def _pt_roundtrip_ok(self):
+        """Self-check: can the loaded templates be serialized back into the exact
+        original bytes? Refuse to write rather than corrupt someone's module."""
+        try:
+            out = serialize_party_templates(self.pt_original, self.pt_header,
+                                            self.pt_line_sep)
+            return encode_module_text(out, self.pt_encoding, self.pt_bom) == self.pt_raw
+        except Exception:
+            return False
 
     def build_pt_tab(self):
         top = ttk.Frame(self.tab_pt)
@@ -1987,11 +2158,17 @@ class ViewerV2:
         def on_troop(ev=None):
             self._apply_pt_stack(k, 0, cmb.current())
         def on_a(*a):
-            self._apply_pt_stack(k, 1, a_var.get())
+            v = safe_int(a_var)
+            if v is None: return      # box cleared (being retyped): skip
+            self._apply_pt_stack(k, 1, v)
         def on_b(*a):
-            self._apply_pt_stack(k, 2, b_var.get())
+            v = safe_int(b_var)
+            if v is None: return
+            self._apply_pt_stack(k, 2, v)
         def on_f(*a):
-            self._apply_pt_stack(k, 3, f_var.get())
+            v = safe_int(f_var)
+            if v is None: return
+            self._apply_pt_stack(k, 3, v)
         cmb.bind("<<ComboboxSelected>>", on_troop)
         sp_a.bind("<FocusOut>", on_a); sp_a.bind("<Return>", on_a)
         sp_b.bind("<FocusOut>", on_b); sp_b.bind("<Return>", on_b)
@@ -2018,9 +2195,23 @@ class ViewerV2:
         if i is None:
             self.set_status("Please select a party template on the left first.", err=True)
             return
-        self.party_templates[i]["stacks"].append([-1, 0, 0, 0])
-        self._fill_pt_stacks(self.party_templates[i])
-        self.pt_stack_count.config(text=f"Troop stacks: {len(self.party_templates[i]['stacks'])}")
+        t = self.party_templates[i]
+        nslots = int(t.get("nslots") or 6)      # stack-slot capacity (always 6 in practice)
+        if len(t["stacks"]) >= nslots:
+            self.set_status(f"Cannot add: this template has only {nslots} slots and they are "
+                            f"all used (each party_templates line has a fixed {nslots} slots; "
+                            f"exceeding it shifts the token count and corrupts the next line). "
+                            f"Delete or edit an existing stack first.", err=True)
+            return
+        # -1 is the empty-slot / end-of-stacks sentinel: an empty slot costs 1 token while
+        # a stack costs 4, so -1 is only a temporary placeholder and a real troop must be
+        # picked before saving (see the guard in save_party_templates).
+        t["stacks"].append([-1, 0, 0, 0])
+        self._fill_pt_stacks(t)
+        self.pt_stack_count.config(text=f"Troop stacks: {len(t['stacks'])} / {nslots}")
+        self.set_status("Added an empty troop stack: pick a troop for it in the dropdown "
+                        "before saving (-1 is the end-of-stacks sentinel; unset stacks are "
+                        "rejected on save).", ok=True)
 
     def _del_pt_stack(self, k):
         i = self.pt_cur
@@ -2067,6 +2258,28 @@ class ViewerV2:
         if self.pt_file is None or not self.party_templates:
             messagebox.showinfo("Info", "First load a module that contains party_templates.txt.")
             return
+        # Guard 1: refuse to write stacks whose troop is unset (-1). -1 is the
+        # end-of-stacks sentinel, so writing it makes everything after it vanish.
+        for _t in self.party_templates:
+            for _k, _s in enumerate(_t["stacks"]):
+                if int(_s[0]) < 0:
+                    messagebox.showerror(
+                        "Cannot save",
+                        f"Template {_t.get('id', '?')}: stack #{_k + 1} has no troop selected (-1).\n\n"
+                        f"-1 is the end-of-stacks sentinel - the engine would treat it as "
+                        f"\"no more stacks here\". Please pick a troop for every new stack "
+                        f"in the dropdown before saving.")
+                    return
+        # Guard 2: round-trip self-check. If this tool cannot restore the file
+        # byte-for-byte, do not write at all rather than corrupt the module.
+        if not getattr(self, "pt_roundtrip_ok", True) and not self._pt_roundtrip_ok():
+            messagebox.showerror(
+                "Cannot save",
+                "Self-check failed: this tool cannot restore that party_templates.txt "
+                "byte-for-byte.\n\nWriting has been blocked to avoid corrupting your module. "
+                "Please send that file to the author - its encoding or layout may be outside "
+                "what the current parser supports.")
+            return
         records = []
         for cur, orig in zip(self.party_templates, self.pt_original):
             tid = cur["id"]
@@ -2088,7 +2301,13 @@ class ViewerV2:
                 shutil.copy2(str(self.pt_file), str(self.pt_file) + ".bak")
             out = serialize_party_templates(self.party_templates, self.pt_header,
                                            self.pt_line_sep)
-            self.pt_file.write_text(out, encoding="utf-8")
+            # Must use write_bytes: write_text is text mode, so on Windows every
+            # '\n' is translated to '\r\n'. A CRLF file doubles into '\r\r\n'
+            # (one extra CR per line break) -> engine reports unexpected end-of-file.
+            data = encode_module_text(out, self.pt_encoding, self.pt_bom)
+            self.pt_file.write_bytes(data)
+            self.pt_raw = data          # re-baseline self-check against the new file
+            self.pt_roundtrip_ok = True
             self.pt_original = copy.deepcopy(self.party_templates)
             self._log_pt_change(records)
             self.set_status(f"Party templates saved with backup: {self.pt_file.name}  ({len(records)} changes)", ok=True)
